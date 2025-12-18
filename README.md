@@ -7,6 +7,7 @@ A universal SCADA protocol library for Rust, providing unified abstractions for 
 - **Protocol Agnostic**: Unified four-remote (T/S/C/A) data model
 - **Dual Mode Support**: Polling and event-driven communication
 - **Zero Business Coupling**: Pure protocol layer, no business logic dependencies
+- **DataStore Abstraction**: Pluggable storage (MemoryStore, RedisStore)
 - **Modular Design**: Protocol implementations in separate crates (pluggable)
 
 ## Supported Protocols
@@ -26,35 +27,72 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-igw = "0.1"                    # Core traits and data model
-voltage_modbus = "0.1"         # Modbus support (optional)
-# voltage_iec104 = "0.1"       # IEC 104 support (optional)
+igw = "0.1"                           # Core traits and data model
+# igw = { version = "0.1", features = ["modbus"] }  # With Modbus adapter
 ```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| `modbus` | Modbus TCP adapter (requires `voltage_modbus`) |
+| `serial` | Serial port support |
+| `tracing-support` | Tracing integration |
+| `full` | All features |
 
 ## Quick Start
 
+### Using DataStore
+
 ```rust
 use igw::prelude::*;
-use voltage_modbus::ModbusTcpClient;  // Protocol from separate crate
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> igw::Result<()> {
-    // Create a Modbus TCP client (implements igw::ProtocolClient)
-    let mut client = ModbusTcpClient::new("192.168.1.100:502")?;
+    // Create an in-memory data store
+    let store = Arc::new(MemoryStore::new());
 
-    // Connect to the device
-    client.connect().await?;
+    // Write some data
+    let mut batch = DataBatch::default();
+    batch.add(DataPoint::telemetry("temperature", 25.5));
+    batch.add(DataPoint::signal("door_open", true));
+    store.write_batch(1, &batch).await?;
 
-    // Read telemetry data
-    let response = client.read(ReadRequest::telemetry()).await?;
+    // Read data back
+    let point = store.read_point(1, "temperature").await?;
+    println!("Temperature: {:?}", point.map(|p| p.value));
 
-    for point in response.data.telemetry {
-        println!("{}: {:?}", point.id, point.value);
-    }
+    Ok(())
+}
+```
 
-    // Disconnect
-    client.disconnect().await?;
+### With Modbus Adapter
 
+```rust
+use igw::prelude::*;
+use igw::protocols::modbus::{ModbusChannel, ModbusChannelConfig};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> igw::Result<()> {
+    let store = Arc::new(MemoryStore::new());
+
+    // Create Modbus channel
+    let config = ModbusChannelConfig::tcp("192.168.1.100:502");
+    let mut channel = ModbusChannel::new(config, store);
+
+    // Connect to device
+    channel.connect().await?;
+
+    // Write control command
+    let result = channel.write_control(&[
+        ControlCommand { id: "pump".into(), value: true }
+    ]).await?;
+
+    println!("Success: {}", result.success_count);
+
+    channel.disconnect().await?;
     Ok(())
 }
 ```

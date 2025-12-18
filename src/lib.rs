@@ -39,6 +39,11 @@
 
 pub mod core;
 pub mod codec;
+pub mod store;
+
+#[cfg(feature = "modbus")]
+#[cfg_attr(docsrs, doc(cfg(feature = "modbus")))]
+pub mod protocols;
 
 /// Prelude module for convenient imports
 pub mod prelude {
@@ -49,6 +54,7 @@ pub mod prelude {
         quality::*,
         error::{GatewayError, Result},
     };
+    pub use crate::store::{DataStore, MemoryStore};
 }
 
 // Re-export core types at crate root for convenience
@@ -59,3 +65,6 @@ pub use crate::core::traits::{
     Protocol, ProtocolClient, ProtocolCapabilities,
     CommunicationMode, ConnectionState,
 };
+
+// Re-export store types
+pub use crate::store::{DataStore, MemoryStore};

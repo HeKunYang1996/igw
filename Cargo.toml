@@ -13,6 +13,9 @@ readme = "README.md"
 [features]
 default = []
 
+# Protocol support
+modbus = ["dep:voltage_modbus"]
+
 # Transport options
 serial = ["dep:tokio-serial"]
 
@@ -20,7 +23,7 @@ serial = ["dep:tokio-serial"]
 tracing-support = ["dep:tracing"]
 
 # Full feature set
-full = ["serial", "tracing-support"]
+full = ["modbus", "serial", "tracing-support"]
 
 [dependencies]
 # Core async runtime
@@ -40,11 +43,17 @@ chrono = { version = "0.4", features = ["serde"] }
 # Byte manipulation
 bytes = "1"
 
+# Concurrent data structures
+dashmap = "6"
+
 # Optional: Serial port support
 tokio-serial = { version = "5", optional = true }
 
 # Optional: Tracing
 tracing = { version = "0.1", optional = true }
+
+# Optional: Modbus protocol support
+voltage_modbus = { path = "../voltage-modbus", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
