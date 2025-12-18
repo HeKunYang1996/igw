@@ -15,6 +15,7 @@ default = []
 
 # Protocol support
 modbus = ["dep:voltage_modbus"]
+iec104 = ["dep:voltage_iec104"]
 
 # Transport options
 serial = ["dep:tokio-serial"]
@@ -23,7 +24,7 @@ serial = ["dep:tokio-serial"]
 tracing-support = ["dep:tracing"]
 
 # Full feature set
-full = ["modbus", "serial", "tracing-support"]
+full = ["modbus", "iec104", "serial", "tracing-support"]
 
 [dependencies]
 # Core async runtime
@@ -54,6 +55,9 @@ tracing = { version = "0.1", optional = true }
 
 # Optional: Modbus protocol support
 voltage_modbus = { path = "../voltage-modbus", optional = true }
+
+# Optional: IEC 60870-5-104 protocol support
+voltage_iec104 = { path = "../voltage-iec104", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
