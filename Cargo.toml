@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
@@ -62,10 +62,10 @@ tokio-serial = { version = "5", optional = true }
 tracing = { version = "0.1", optional = true }
 
 # Optional: Modbus protocol support
-voltage_modbus = { version = "0.4", path = "deps/voltage-modbus", optional = true }
+voltage_modbus = { version = "0.4", optional = true }
 
 # Optional: IEC 60870-5-104 protocol support
-voltage_iec104 = { version = "0.1", path = "deps/voltage-iec104", optional = true }
+voltage_iec104 = { version = "0.1", optional = true }
 
 # Optional: OPC UA protocol support
 async-opcua = { version = "0.14", default-features = false, features = ["client"], optional = true }
@@ -73,7 +73,7 @@ async-opcua = { version = "0.14", default-features = false, features = ["client"
 # Optional: J1939/CAN protocol support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "3.3", optional = true }
-voltage_j1939 = { version = "0.1", path = "deps/voltage-j1939", optional = true }
+voltage_j1939 = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
