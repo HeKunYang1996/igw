@@ -82,7 +82,8 @@ async fn main() -> igw::Result<()> {
     let config = ModbusChannelConfig::tcp("192.168.1.100:502")
         .with_timeout(Duration::from_secs(5));
 
-    let mut channel = ModbusChannel::new(config);
+    // Create channel with unique channel_id
+    let mut channel = ModbusChannel::new(config, 1);
 
     // Connect to device
     channel.connect().await?;
@@ -181,6 +182,39 @@ pub trait EventDrivenProtocol: Protocol {
     fn subscribe(&self) -> DataEventReceiver;
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>);
 }
+```
+
+## Channel Logging
+
+All protocol adapters support unified channel logging via the `LoggableProtocol` trait:
+
+```rust
+use std::sync::Arc;
+use igw::{ChannelLogConfig, ChannelLogHandler, ChannelLogEvent, LoggableProtocol};
+use igw::protocols::modbus::{ModbusChannel, ModbusChannelConfig};
+
+// Implement custom log handler
+struct MyLogHandler;
+
+#[async_trait::async_trait]
+impl ChannelLogHandler for MyLogHandler {
+    async fn on_log(&self, channel_id: u32, event: ChannelLogEvent) {
+        match event {
+            ChannelLogEvent::Connected { endpoint, duration_ms, .. } => {
+                println!("[CH:{}] Connected to {} ({}ms)", channel_id, endpoint, duration_ms);
+            }
+            ChannelLogEvent::Error { error, .. } => {
+                eprintln!("[CH:{}] Error: {}", channel_id, error);
+            }
+            _ => {}
+        }
+    }
+}
+
+// Configure logging
+let mut channel = ModbusChannel::new(ModbusChannelConfig::tcp("127.0.0.1:502"), 1);
+channel.set_log_handler(Arc::new(MyLogHandler));
+channel.set_log_config(ChannelLogConfig::all());  // or errors_only(), disabled()
 ```
 
 ## License

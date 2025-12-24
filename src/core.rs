@@ -4,6 +4,7 @@
 
 pub mod data;
 pub mod error;
+pub mod logging;
 pub mod point;
 pub mod quality;
 pub mod traits;

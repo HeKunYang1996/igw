@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
@@ -86,7 +86,7 @@ toml = { version = "0.8", optional = true }
 
 # Optional: J1939/CAN protocol support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = { version = "3.3", optional = true }
+socketcan = { version = "3.5", optional = true }
 voltage_j1939 = { version = "0.1", optional = true }
 
 [dev-dependencies]

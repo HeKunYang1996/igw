@@ -37,6 +37,9 @@ use voltage_modbus::ModbusRtuClient;
 
 use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 use crate::core::error::{GatewayError, Result};
+use crate::core::logging::{
+    ChannelLogConfig, ChannelLogHandler, ErrorContext, LogContext, LoggableProtocol,
+};
 use crate::core::point::{DataFormat, PointConfig, ProtocolAddress};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
@@ -410,6 +413,8 @@ impl ModbusChannelConfig {
 /// ```
 pub struct ModbusChannel {
     config: ModbusChannelConfig,
+    /// Channel identifier for logging.
+    channel_id: u32,
     /// Client wrapped in Arc<Mutex> for shared access from polling task.
     /// Uses ModbusClientWrapper to support both TCP and RTU transports.
     client: Arc<Mutex<Option<ModbusClientWrapper>>>,
@@ -433,6 +438,10 @@ pub struct ModbusChannel {
     // === Command batching ===
     /// Command batcher for optimizing write operations
     command_batcher: Arc<Mutex<CommandBatcher>>,
+
+    // === Logging ===
+    /// Logging context for channel events
+    log_context: Arc<LogContext>,
 }
 
 #[derive(Debug, Default)]
@@ -451,21 +460,23 @@ impl ModbusChannel {
     ///
     /// # Arguments
     /// - `config`: Channel configuration including address and points
+    /// - `channel_id`: Unique identifier for this channel (used in logs)
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let config = ModbusChannelConfig::tcp("192.168.1.100:502")
     ///     .with_points(points);
-    /// let mut channel = ModbusChannel::new(config);
+    /// let mut channel = ModbusChannel::new(config, 1);
     /// channel.connect().await?;
     ///
     /// // Poll and get data (service layer stores it)
     /// let batch = channel.poll_once().await?;
     /// ```
-    pub fn new(config: ModbusChannelConfig) -> Self {
+    pub fn new(config: ModbusChannelConfig, channel_id: u32) -> Self {
         Self {
             config,
+            channel_id,
             client: Arc::new(Mutex::new(None)),
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
@@ -475,6 +486,7 @@ impl ModbusChannel {
             polling_interval_ms: DEFAULT_POLLING_INTERVAL_MS,
             reconnect_state: Arc::new(std::sync::RwLock::new(ReconnectState::default())),
             command_batcher: Arc::new(Mutex::new(CommandBatcher::new())),
+            log_context: Arc::new(LogContext::new(channel_id)),
         }
     }
 
@@ -1092,6 +1104,33 @@ impl ProtocolCapabilities for ModbusChannel {
     }
 }
 
+impl LoggableProtocol for ModbusChannel {
+    fn set_log_handler(&mut self, handler: Arc<dyn ChannelLogHandler>) {
+        // Create a new LogContext with the handler
+        let new_ctx = LogContext::new(self.channel_id)
+            .with_handler(handler)
+            .with_config(self.log_context.config().clone());
+        self.log_context = Arc::new(new_ctx);
+    }
+
+    fn set_log_config(&mut self, config: ChannelLogConfig) {
+        // We need to recreate the LogContext since it's behind Arc
+        // For simplicity, we use Arc::make_mut pattern or recreate
+        if let Some(ctx) = Arc::get_mut(&mut self.log_context) {
+            ctx.set_config(config);
+        } else {
+            // Clone and update
+            let mut new_ctx = (*self.log_context).clone();
+            new_ctx.set_config(config);
+            self.log_context = Arc::new(new_ctx);
+        }
+    }
+
+    fn log_config(&self) -> &ChannelLogConfig {
+        self.log_context.config()
+    }
+}
+
 impl Protocol for ModbusChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
@@ -1126,7 +1165,23 @@ impl Protocol for ModbusChannel {
 
 impl ProtocolClient for ModbusChannel {
     async fn connect(&mut self) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        let old_state = self.get_state();
         self.set_state(ConnectionState::Connecting);
+
+        // Log state change
+        self.log_context
+            .log_state_changed(old_state, ConnectionState::Connecting)
+            .await;
+
+        // Get endpoint for logging
+        let endpoint = match self.config.connection_mode {
+            ConnectionMode::Tcp => self.config.address.clone(),
+            #[cfg(feature = "modbus-rtu")]
+            ConnectionMode::Rtu => {
+                format!("{}@{}", self.config.rtu_device, self.config.baud_rate)
+            }
+        };
 
         // Create client based on connection mode
         let connect_result = match self.config.connection_mode {
@@ -1152,11 +1207,20 @@ impl ProtocolClient for ModbusChannel {
             }
         };
 
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
         match connect_result {
             Ok(wrapper) => {
                 let mut client_guard = self.client.lock().await;
                 *client_guard = Some(wrapper);
                 self.set_state(ConnectionState::Connected);
+
+                // Log successful connection
+                self.log_context.log_connected(&endpoint, duration_ms).await;
+                self.log_context
+                    .log_state_changed(ConnectionState::Connecting, ConnectionState::Connected)
+                    .await;
+
                 // Pre-group points after successful connection
                 self.group_points_for_polling().await;
                 Ok(())
@@ -1164,12 +1228,23 @@ impl ProtocolClient for ModbusChannel {
             Err(e) => {
                 self.set_state(ConnectionState::Error);
                 self.record_error(&e.to_string()).await;
+
+                // Log error
+                self.log_context
+                    .log_error(&e.to_string(), ErrorContext::Connection)
+                    .await;
+                self.log_context
+                    .log_state_changed(ConnectionState::Connecting, ConnectionState::Error)
+                    .await;
+
                 Err(e)
             }
         }
     }
 
     async fn disconnect(&mut self) -> Result<()> {
+        let old_state = self.get_state();
+
         // Stop polling first if running
         if self.is_polling.load(Ordering::SeqCst) {
             self.stop_polling().await?;
@@ -1180,10 +1255,19 @@ impl ProtocolClient for ModbusChannel {
             let _ = client.close().await;
         }
         self.set_state(ConnectionState::Disconnected);
+
+        // Log disconnection
+        self.log_context.log_disconnected(None).await;
+        self.log_context
+            .log_state_changed(old_state, ConnectionState::Disconnected)
+            .await;
+
         Ok(())
     }
 
     async fn poll_once(&mut self) -> Result<DataBatch> {
+        let start_time = std::time::Instant::now();
+
         // Ensure points are grouped for efficient polling
         if self.grouped_points.read().await.is_empty() && !self.config.points.is_empty() {
             self.group_points_for_polling().await;
@@ -1193,7 +1277,12 @@ impl ProtocolClient for ModbusChannel {
         let mut client_guard = self.client.lock().await;
         let client = match client_guard.as_mut() {
             Some(c) => c,
-            None => return Err(GatewayError::NotConnected),
+            None => {
+                self.log_context
+                    .log_error("Not connected", ErrorContext::Polling)
+                    .await;
+                return Err(GatewayError::NotConnected);
+            }
         };
 
         // Read all point groups - clone to release lock before async I/O
@@ -1233,16 +1322,30 @@ impl ProtocolClient for ModbusChannel {
             diag.error_count += error_count;
         }
 
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
         debug!(
             "[{}] poll_once: read {} points",
             self.config.address,
             batch.len()
         );
 
+        // Log poll cycle
+        self.log_context
+            .log_poll_cycle(
+                batch.clone(),
+                duration_ms,
+                read_count as usize,
+                error_count as usize,
+            )
+            .await;
+
         Ok(batch)
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
+        let start_time = std::time::Instant::now();
+        let commands_vec = commands.to_vec();
         let mut success_count = 0;
         let mut failures = Vec::new();
         let mut errors_to_record = Vec::new();
@@ -1251,7 +1354,17 @@ impl ProtocolClient for ModbusChannel {
         let mut client_guard = self.client.lock().await;
         let client = match client_guard.as_mut() {
             Some(c) => c,
-            None => return Err(GatewayError::NotConnected),
+            None => {
+                let err = GatewayError::NotConnected;
+                self.log_context
+                    .log_control_write(
+                        commands_vec,
+                        Err(err.to_string()),
+                        start_time.elapsed().as_millis() as u64,
+                    )
+                    .await;
+                return Err(err);
+            }
         };
 
         for cmd in commands {
@@ -1308,13 +1421,23 @@ impl ProtocolClient for ModbusChannel {
             }
         }
 
-        Ok(WriteResult {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let result = WriteResult {
             success_count,
             failures,
-        })
+        };
+
+        // Log control write
+        self.log_context
+            .log_control_write(commands_vec, Ok(result.clone()), duration_ms)
+            .await;
+
+        Ok(result)
     }
 
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
+        let start_time = std::time::Instant::now();
+        let adjustments_vec = adjustments.to_vec();
         let mut success_count = 0;
         let mut failures = Vec::new();
         let mut errors_to_record = Vec::new();
@@ -1323,7 +1446,17 @@ impl ProtocolClient for ModbusChannel {
         let mut client_guard = self.client.lock().await;
         let client = match client_guard.as_mut() {
             Some(c) => c,
-            None => return Err(GatewayError::NotConnected),
+            None => {
+                let err = GatewayError::NotConnected;
+                self.log_context
+                    .log_adjustment_write(
+                        adjustments_vec,
+                        Err(err.to_string()),
+                        start_time.elapsed().as_millis() as u64,
+                    )
+                    .await;
+                return Err(err);
+            }
         };
 
         for adj in adjustments {
@@ -1404,10 +1537,18 @@ impl ProtocolClient for ModbusChannel {
             }
         }
 
-        Ok(WriteResult {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let result = WriteResult {
             success_count,
             failures,
-        })
+        };
+
+        // Log adjustment write
+        self.log_context
+            .log_adjustment_write(adjustments_vec, Ok(result.clone()), duration_ms)
+            .await;
+
+        Ok(result)
     }
 
     /// Start background polling task (legacy method).
@@ -1716,7 +1857,7 @@ mod tests {
     #[test]
     fn test_modbus_channel_capabilities() {
         let config = ModbusChannelConfig::tcp("127.0.0.1:502");
-        let channel = ModbusChannel::new(config);
+        let channel = ModbusChannel::new(config, 1);
 
         assert_eq!(channel.name(), "Modbus TCP");
         assert_eq!(channel.supported_modes(), &[CommunicationMode::Polling]);
@@ -1725,7 +1866,7 @@ mod tests {
     #[test]
     fn test_polling_interval_builder() {
         let config = ModbusChannelConfig::tcp("127.0.0.1:502");
-        let channel = ModbusChannel::new(config).with_polling_interval(500);
+        let channel = ModbusChannel::new(config, 1).with_polling_interval(500);
 
         assert_eq!(channel.polling_interval_ms, 500);
     }
@@ -1756,7 +1897,7 @@ mod tests {
         let reconnect = ReconnectConfig::new().with_cooldown_ms(10_000);
         let config = ModbusChannelConfig::tcp("127.0.0.1:502").with_reconnect(reconnect);
 
-        let channel = ModbusChannel::new(config);
+        let channel = ModbusChannel::new(config, 1);
         assert_eq!(channel.config.reconnect.cooldown_ms, 10_000);
     }
 
@@ -1766,7 +1907,7 @@ mod tests {
         assert_eq!(config.connection_mode, ConnectionMode::Tcp);
         assert_eq!(config.address, "192.168.1.100:502");
 
-        let channel = ModbusChannel::new(config);
+        let channel = ModbusChannel::new(config, 1);
         assert_eq!(channel.name(), "Modbus TCP");
     }
 
@@ -1779,7 +1920,7 @@ mod tests {
         assert_eq!(config.rtu_device, "/dev/ttyUSB0");
         assert_eq!(config.baud_rate, 9600);
 
-        let channel = ModbusChannel::new(config);
+        let channel = ModbusChannel::new(config, 1);
         assert_eq!(channel.name(), "Modbus RTU");
     }
 }
