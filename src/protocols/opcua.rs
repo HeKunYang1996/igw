@@ -644,10 +644,7 @@ impl Protocol for OpcUaChannel {
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
         // OPC UA supports direct reading
-        let _session = self
-            .session
-            .as_ref()
-            .ok_or(GatewayError::NotConnected)?;
+        let _session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         // Determine points to read
         let points_to_read: Vec<_> = if let Some(ids) = &request.point_ids {

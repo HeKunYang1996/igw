@@ -57,8 +57,8 @@ pub mod prelude {
 pub use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 pub use crate::core::error::{GatewayError, Result};
 pub use crate::core::logging::{
-    ChannelLogConfig, ChannelLogEvent, ChannelLogHandler, LogContext, LogEventType,
-    LogVerbosity, LoggableProtocol, PacketDirection, PacketMetadata,
+    ChannelLogConfig, ChannelLogEvent, ChannelLogHandler, LogContext, LogEventType, LogVerbosity,
+    LoggableProtocol, PacketDirection, PacketMetadata,
 };
 pub use crate::core::quality::Quality;
 pub use crate::core::traits::{

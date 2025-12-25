@@ -884,9 +884,9 @@ impl CompositeLogHandler {
         }
     }
 
-    /// Add a handler.
+    /// Add a handler (builder pattern).
     #[must_use]
-    pub fn add(mut self, handler: Arc<dyn ChannelLogHandler>) -> Self {
+    pub fn with_handler(mut self, handler: Arc<dyn ChannelLogHandler>) -> Self {
         self.handlers.push(handler);
         self
     }

@@ -17,8 +17,8 @@
 //! use igw::protocols::gpio::{GpioChannel, GpioChannelConfig, GpioPinConfig};
 //!
 //! let config = GpioChannelConfig::new()
-//!     .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "door_sensor"))
-//!     .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "alarm_led"));
+//!     .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, 1))   // DI point_id=1
+//!     .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101)); // DO point_id=101
 //!
 //! let mut gpio = GpioChannel::new(config);
 //! gpio.connect().await?;
@@ -27,7 +27,7 @@
 //! let response = gpio.read(ReadRequest::all()).await?;
 //!
 //! // Control DO
-//! gpio.write_control(&[ControlCommand::latching("alarm_led", true)]).await?;
+//! gpio.write_control(&[ControlCommand::latching(101, true)]).await?;
 //! ```
 
 use std::sync::Arc;
@@ -60,14 +60,14 @@ pub struct GpioPinConfig {
     /// GPIO chip name (e.g., "gpiochip0").
     pub chip: String,
 
-    /// Pin number/offset.
+    /// Pin number/offset on the GPIO chip.
     pub pin: u32,
 
     /// Pin direction.
     pub direction: GpioDirection,
 
-    /// Point ID mapping.
-    pub point_id: String,
+    /// Point ID for SCADA mapping (matches DataPoint/ControlCommand IDs).
+    pub point_id: u32,
 
     /// Active low (invert logic).
     pub active_low: bool,
@@ -78,24 +78,24 @@ pub struct GpioPinConfig {
 
 impl GpioPinConfig {
     /// Create a digital input configuration.
-    pub fn digital_input(chip: impl Into<String>, pin: u32, point_id: impl Into<String>) -> Self {
+    pub fn digital_input(chip: impl Into<String>, pin: u32, point_id: u32) -> Self {
         Self {
             chip: chip.into(),
             pin,
             direction: GpioDirection::Input,
-            point_id: point_id.into(),
+            point_id,
             active_low: false,
             debounce_us: Some(1000), // 1ms default debounce
         }
     }
 
     /// Create a digital output configuration.
-    pub fn digital_output(chip: impl Into<String>, pin: u32, point_id: impl Into<String>) -> Self {
+    pub fn digital_output(chip: impl Into<String>, pin: u32, point_id: u32) -> Self {
         Self {
             chip: chip.into(),
             pin,
             direction: GpioDirection::Output,
-            point_id: point_id.into(),
+            point_id,
             active_low: false,
             debounce_us: None,
         }
@@ -180,8 +180,8 @@ pub struct GpioChannel {
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<GpioDiagnostics>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
-    // Output states (simulated)
-    output_states: Arc<RwLock<std::collections::HashMap<String, bool>>>,
+    // Output states cache (for read-back)
+    output_states: Arc<RwLock<std::collections::HashMap<u32, bool>>>,
 }
 
 impl GpioChannel {
@@ -233,7 +233,7 @@ impl GpioChannel {
         let value = values[0];
         let adjusted = if pin_config.active_low { !value } else { value };
 
-        Ok(DataPoint::signal(&pin_config.point_id, adjusted))
+        Ok(DataPoint::signal(pin_config.point_id, adjusted))
     }
 
     /// Write to a single GPIO pin using tokio-gpiod.
@@ -268,14 +268,14 @@ impl GpioChannel {
         self.output_states
             .write()
             .await
-            .insert(pin_config.point_id.clone(), adjusted);
+            .insert(pin_config.point_id, adjusted);
 
         Ok(())
     }
 
     /// Read output state (for feedback).
-    async fn read_output_state(&self, point_id: &str) -> Option<bool> {
-        self.output_states.read().await.get(point_id).copied()
+    async fn read_output_state(&self, point_id: u32) -> Option<bool> {
+        self.output_states.read().await.get(&point_id).copied()
     }
 }
 
@@ -328,8 +328,8 @@ impl Protocol for GpioChannel {
                 }
             }
 
-            if let Some(state) = self.read_output_state(&pin.point_id).await {
-                batch.add(DataPoint::control(&pin.point_id, state));
+            if let Some(state) = self.read_output_state(pin.point_id).await {
+                batch.add(DataPoint::control(pin.point_id, state));
             }
         }
 
@@ -401,10 +401,10 @@ impl ProtocolClient for GpioChannel {
             match pin {
                 Some(p) => match self.write_pin(p, cmd.value).await {
                     Ok(()) => success_count += 1,
-                    Err(e) => failures.push((cmd.id.clone(), e.to_string())),
+                    Err(e) => failures.push((cmd.id, e.to_string())),
                 },
                 None => {
-                    failures.push((cmd.id.clone(), "Output pin not found".into()));
+                    failures.push((cmd.id, "Output pin not found".into()));
                 }
             }
         }
@@ -452,8 +452,8 @@ mod tests {
     #[tokio::test]
     async fn test_gpio_channel_connect() {
         let config = GpioChannelConfig::new()
-            .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "input1"))
-            .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "output1"));
+            .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, 1))
+            .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101));
 
         let mut gpio = GpioChannel::new(config);
 
@@ -469,13 +469,13 @@ mod tests {
     #[tokio::test]
     async fn test_gpio_write_control() {
         let config =
-            GpioChannelConfig::new().add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "led"));
+            GpioChannelConfig::new().add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101));
 
         let mut gpio = GpioChannel::new(config);
         gpio.connect().await.unwrap();
 
         let result = gpio
-            .write_control(&[ControlCommand::latching("led", true)])
+            .write_control(&[ControlCommand::latching(101, true)])
             .await
             .unwrap();
 
@@ -483,15 +483,15 @@ mod tests {
         assert!(result.failures.is_empty());
 
         // Check output state
-        let state = gpio.read_output_state("led").await;
+        let state = gpio.read_output_state(101).await;
         assert_eq!(state, Some(true));
     }
 
     #[tokio::test]
     async fn test_gpio_diagnostics() {
         let config = GpioChannelConfig::new()
-            .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "di1"))
-            .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "do1"));
+            .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, 1))
+            .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101));
 
         let gpio = GpioChannel::new(config);
         let diag = gpio.diagnostics().await.unwrap();
