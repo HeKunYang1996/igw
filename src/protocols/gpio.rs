@@ -678,6 +678,9 @@ pub struct GpioChannel {
 
 impl GpioChannel {
     /// Create a new GPIO channel with the configured driver.
+    ///
+    /// GPIO channels are always "connected" since they operate on local hardware
+    /// without requiring external network connections (unlike Modbus TCP).
     pub fn new(config: GpioChannelConfig) -> Self {
         // Create driver based on configuration
         let driver: Box<dyn GpioDriver> = match &config.driver {
@@ -687,7 +690,8 @@ impl GpioChannel {
         Self {
             config,
             driver,
-            state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
+            // GPIO is always "connected" - it's local hardware, no external connection needed
+            state: Arc::new(std::sync::RwLock::new(ConnectionState::Connected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
             output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -698,11 +702,13 @@ impl GpioChannel {
     /// Create a GPIO channel with a custom driver.
     ///
     /// This allows using custom driver implementations beyond the built-in ones.
+    /// GPIO channels are always "connected" since they operate on local hardware.
     pub fn with_driver(config: GpioChannelConfig, driver: Box<dyn GpioDriver>) -> Self {
         Self {
             config,
             driver,
-            state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
+            // GPIO is always "connected" - it's local hardware, no external connection needed
+            state: Arc::new(std::sync::RwLock::new(ConnectionState::Connected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
             output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -987,11 +993,14 @@ mod tests {
 
         let mut gpio = GpioChannel::new(config);
 
-        assert_eq!(gpio.connection_state(), ConnectionState::Disconnected);
+        // GPIO is always connected on creation (local hardware, no external connection)
+        assert_eq!(gpio.connection_state(), ConnectionState::Connected);
 
+        // connect() is idempotent for GPIO
         gpio.connect().await.unwrap();
         assert_eq!(gpio.connection_state(), ConnectionState::Connected);
 
+        // disconnect() still works for explicit shutdown
         gpio.disconnect().await.unwrap();
         assert_eq!(gpio.connection_state(), ConnectionState::Disconnected);
     }
