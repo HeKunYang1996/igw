@@ -1,24 +1,48 @@
 //! GPIO (General Purpose Input/Output) protocol adapter.
 //!
-//! Provides direct hardware GPIO control on Linux systems.
+//! Provides direct hardware GPIO control on Linux systems with a pluggable driver architecture.
 //!
 //! # Platform Support
 //!
-//! **Linux only**: Uses tokio-gpiod (libgpiod v2 character device interface).
-//! This module is not available on other platforms.
+//! **Linux only**: Supports multiple GPIO backends:
+//! - `gpiod`: Modern character device interface (libgpiod v2) - **recommended**
+//! - `sysfs`: Legacy sysfs interface (`/sys/class/gpio/`) - for compatibility
 //!
 //! # Feature Flag
 //!
 //! Requires `gpio` feature to be enabled.
 //!
+//! # Driver Architecture
+//!
+//! The GPIO module uses a trait-based driver system for extensibility:
+//!
+//! ```text
+//!              ┌─────────────────────────┐
+//!              │     GpioDriver trait    │
+//!              └───────────┬─────────────┘
+//!                          │
+//!      ┌───────────┬───────┼───────┬───────────┐
+//!      ▼           ▼       ▼       ▼           ▼
+//!   GpiodDriver  SysfsDriver  (future)  MockDriver  ...
+//!   (chardev)    (/sys/)               (testing)
+//! ```
+//!
 //! # Example
 //!
 //! ```rust,ignore
-//! use igw::protocols::gpio::{GpioChannel, GpioChannelConfig, GpioPinConfig};
+//! use igw::protocols::gpio::{GpioChannel, GpioChannelConfig, GpioPinConfig, GpioDriverType};
 //!
+//! // Using gpiod (chardev) - recommended
 //! let config = GpioChannelConfig::new()
-//!     .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, 1))   // DI point_id=1
-//!     .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101)); // DO point_id=101
+//!     .with_driver(GpioDriverType::Gpiod)
+//!     .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, 1))
+//!     .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, 101));
+//!
+//! // Using sysfs - for legacy compatibility
+//! let config = GpioChannelConfig::new()
+//!     .with_driver(GpioDriverType::Sysfs { base_path: "/sys/class/gpio".into() })
+//!     .add_pin(GpioPinConfig::digital_input_sysfs(490, 1))  // GPIO 490
+//!     .add_pin(GpioPinConfig::digital_output_sysfs(491, 101));
 //!
 //! let mut gpio = GpioChannel::new(config);
 //! gpio.connect().await?;
@@ -31,19 +55,308 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use tokio_gpiod::{Chip, Options};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
+use crate::core::logging::{ChannelLogConfig, ChannelLogHandler, LogContext, LoggableProtocol};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
     WriteResult,
 };
+
+// ============================================================================
+// GPIO Driver Trait (Extensible Driver Architecture)
+// ============================================================================
+
+/// GPIO driver type selection.
+///
+/// Determines which backend is used for GPIO operations.
+#[derive(Debug, Clone)]
+pub enum GpioDriverType {
+    /// Modern character device interface (libgpiod v2).
+    /// Uses `/dev/gpiochipN` devices. **Recommended for new projects.**
+    Gpiod,
+
+    /// Legacy sysfs interface.
+    /// Uses `/sys/class/gpio/` filesystem. For compatibility with older systems.
+    Sysfs {
+        /// Base path for sysfs GPIO (default: "/sys/class/gpio")
+        base_path: String,
+    },
+}
+
+impl Default for GpioDriverType {
+    fn default() -> Self {
+        Self::Gpiod
+    }
+}
+
+/// GPIO driver trait - extensible interface for GPIO backends.
+///
+/// Implement this trait to add support for new GPIO backends (e.g., BDaq, custom hardware).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// pub struct MyCustomDriver { /* ... */ }
+///
+/// #[async_trait]
+/// impl GpioDriver for MyCustomDriver {
+///     fn name(&self) -> &'static str { "my-custom" }
+///     async fn read_pin(&self, gpio_num: u32) -> Result<bool> { /* ... */ }
+///     async fn write_pin(&self, gpio_num: u32, value: bool) -> Result<()> { /* ... */ }
+/// }
+/// ```
+#[async_trait]
+pub trait GpioDriver: Send + Sync {
+    /// Driver name for diagnostics.
+    fn name(&self) -> &'static str;
+
+    /// Read a GPIO pin value.
+    ///
+    /// # Arguments
+    /// * `pin` - Pin configuration (contains chip/gpio_number, direction, etc.)
+    ///
+    /// # Returns
+    /// Raw pin value (before active_low adjustment).
+    async fn read_pin(&self, pin: &GpioPinConfig) -> Result<bool>;
+
+    /// Write a GPIO pin value.
+    ///
+    /// # Arguments
+    /// * `pin` - Pin configuration
+    /// * `value` - Value to write (before active_low adjustment)
+    async fn write_pin(&self, pin: &GpioPinConfig, value: bool) -> Result<()>;
+
+    /// Initialize the driver (optional).
+    async fn init(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Shutdown the driver (optional).
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Gpiod Driver (Modern chardev interface)
+// ============================================================================
+
+/// Gpiod driver using libgpiod v2 character device interface.
+///
+/// Uses `/dev/gpiochipN` for GPIO access. This is the recommended driver for modern Linux systems.
+pub struct GpiodDriver;
+
+impl GpiodDriver {
+    /// Create a new gpiod driver.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for GpiodDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl GpioDriver for GpiodDriver {
+    fn name(&self) -> &'static str {
+        "gpiod"
+    }
+
+    async fn read_pin(&self, pin: &GpioPinConfig) -> Result<bool> {
+        let chip = Chip::new(&pin.chip).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", pin.chip, e))
+        })?;
+
+        let opts = Options::input([pin.pin]).consumer("igw");
+        let lines = chip.request_lines(opts).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to request GPIO line {} on chip '{}': {}",
+                pin.pin, pin.chip, e
+            ))
+        })?;
+
+        let values = lines.get_values([false]).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to read GPIO pin {}: {}", pin.pin, e))
+        })?;
+
+        Ok(values[0])
+    }
+
+    async fn write_pin(&self, pin: &GpioPinConfig, value: bool) -> Result<()> {
+        let chip = Chip::new(&pin.chip).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", pin.chip, e))
+        })?;
+
+        let opts = Options::output([pin.pin]).consumer("igw").values([value]);
+        let lines = chip.request_lines(opts).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to request GPIO line {} on chip '{}': {}",
+                pin.pin, pin.chip, e
+            ))
+        })?;
+
+        lines.set_values([value]).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to write GPIO pin {}: {}", pin.pin, e))
+        })?;
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Sysfs Driver (Legacy interface)
+// ============================================================================
+
+/// Sysfs driver using legacy `/sys/class/gpio/` interface.
+///
+/// This driver is provided for compatibility with:
+/// - Older Linux kernels (< 4.8)
+/// - Industrial devices that use sysfs (e.g., Advantech ECU series)
+/// - Systems where GPIO is already exported via sysfs
+///
+/// **Note**: sysfs GPIO is deprecated since Linux 4.8. Use `GpiodDriver` for new projects.
+pub struct SysfsDriver {
+    base_path: String,
+}
+
+impl SysfsDriver {
+    /// Create a new sysfs driver.
+    ///
+    /// # Arguments
+    /// * `base_path` - Path to sysfs GPIO (typically "/sys/class/gpio")
+    pub fn new(base_path: impl Into<String>) -> Self {
+        Self {
+            base_path: base_path.into(),
+        }
+    }
+
+    /// Get the path for a GPIO's direction file.
+    fn direction_path(&self, gpio_num: u32) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.base_path)
+            .join(format!("gpio{}", gpio_num))
+            .join("direction")
+    }
+
+    /// Get the path for a GPIO's value file.
+    fn value_path(&self, gpio_num: u32) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.base_path)
+            .join(format!("gpio{}", gpio_num))
+            .join("value")
+    }
+
+    /// Export a GPIO if not already exported.
+    async fn ensure_exported(&self, gpio_num: u32) -> Result<()> {
+        let gpio_path = std::path::PathBuf::from(&self.base_path).join(format!("gpio{}", gpio_num));
+
+        if !gpio_path.exists() {
+            let export_path = std::path::PathBuf::from(&self.base_path).join("export");
+            tokio::fs::write(&export_path, gpio_num.to_string())
+                .await
+                .map_err(|e| {
+                    GatewayError::Protocol(format!("Failed to export GPIO {}: {}", gpio_num, e))
+                })?;
+
+            // Wait for sysfs to create the GPIO directory
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Set GPIO direction.
+    async fn set_direction(&self, gpio_num: u32, direction: GpioDirection) -> Result<()> {
+        let dir_str = match direction {
+            GpioDirection::Input => "in",
+            GpioDirection::Output => "out",
+        };
+
+        tokio::fs::write(self.direction_path(gpio_num), dir_str)
+            .await
+            .map_err(|e| {
+                GatewayError::Protocol(format!(
+                    "Failed to set GPIO {} direction to {}: {}",
+                    gpio_num, dir_str, e
+                ))
+            })?;
+
+        Ok(())
+    }
+}
+
+impl Default for SysfsDriver {
+    fn default() -> Self {
+        Self::new("/sys/class/gpio")
+    }
+}
+
+#[async_trait]
+impl GpioDriver for SysfsDriver {
+    fn name(&self) -> &'static str {
+        "sysfs"
+    }
+
+    async fn read_pin(&self, pin: &GpioPinConfig) -> Result<bool> {
+        let gpio_num = pin.gpio_number.ok_or_else(|| {
+            GatewayError::Protocol(format!(
+                "GPIO number not set for pin {} (required for sysfs driver)",
+                pin.point_id
+            ))
+        })?;
+
+        // Ensure GPIO is exported and set as input
+        self.ensure_exported(gpio_num).await?;
+        self.set_direction(gpio_num, GpioDirection::Input).await?;
+
+        // Read value
+        let value_str = tokio::fs::read_to_string(self.value_path(gpio_num))
+            .await
+            .map_err(|e| {
+                GatewayError::Protocol(format!("Failed to read GPIO {}: {}", gpio_num, e))
+            })?;
+
+        let value = value_str.trim() == "1";
+        Ok(value)
+    }
+
+    async fn write_pin(&self, pin: &GpioPinConfig, value: bool) -> Result<()> {
+        let gpio_num = pin.gpio_number.ok_or_else(|| {
+            GatewayError::Protocol(format!(
+                "GPIO number not set for pin {} (required for sysfs driver)",
+                pin.point_id
+            ))
+        })?;
+
+        // Ensure GPIO is exported and set as output
+        self.ensure_exported(gpio_num).await?;
+        self.set_direction(gpio_num, GpioDirection::Output).await?;
+
+        // Write value
+        let value_str = if value { "1" } else { "0" };
+        tokio::fs::write(self.value_path(gpio_num), value_str)
+            .await
+            .map_err(|e| {
+                GatewayError::Protocol(format!("Failed to write GPIO {}: {}", gpio_num, e))
+            })?;
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Pin Configuration
+// ============================================================================
 
 /// GPIO pin direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,13 +368,19 @@ pub enum GpioDirection {
 }
 
 /// GPIO pin configuration.
+///
+/// Supports both gpiod (chip + pin) and sysfs (gpio_number) addressing.
 #[derive(Debug, Clone)]
 pub struct GpioPinConfig {
-    /// GPIO chip name (e.g., "gpiochip0").
+    /// GPIO chip name (e.g., "gpiochip0") - for gpiod driver.
     pub chip: String,
 
-    /// Pin number/offset on the GPIO chip.
+    /// Pin number/offset on the GPIO chip - for gpiod driver.
     pub pin: u32,
+
+    /// Global GPIO number (e.g., 490) - for sysfs driver.
+    /// This is the number used in `/sys/class/gpio/gpioN/`.
+    pub gpio_number: Option<u32>,
 
     /// Pin direction.
     pub direction: GpioDirection,
@@ -77,11 +396,17 @@ pub struct GpioPinConfig {
 }
 
 impl GpioPinConfig {
-    /// Create a digital input configuration.
+    /// Create a digital input configuration for gpiod driver.
+    ///
+    /// # Arguments
+    /// * `chip` - GPIO chip name (e.g., "gpiochip0")
+    /// * `pin` - Pin offset on the chip
+    /// * `point_id` - SCADA point ID
     pub fn digital_input(chip: impl Into<String>, pin: u32, point_id: u32) -> Self {
         Self {
             chip: chip.into(),
             pin,
+            gpio_number: None,
             direction: GpioDirection::Input,
             point_id,
             active_low: false,
@@ -89,16 +414,53 @@ impl GpioPinConfig {
         }
     }
 
-    /// Create a digital output configuration.
+    /// Create a digital output configuration for gpiod driver.
     pub fn digital_output(chip: impl Into<String>, pin: u32, point_id: u32) -> Self {
         Self {
             chip: chip.into(),
             pin,
+            gpio_number: None,
             direction: GpioDirection::Output,
             point_id,
             active_low: false,
             debounce_us: None,
         }
+    }
+
+    /// Create a digital input configuration for sysfs driver.
+    ///
+    /// # Arguments
+    /// * `gpio_number` - Global GPIO number (e.g., 490 for `/sys/class/gpio/gpio490/`)
+    /// * `point_id` - SCADA point ID
+    pub fn digital_input_sysfs(gpio_number: u32, point_id: u32) -> Self {
+        Self {
+            chip: String::new(),
+            pin: 0,
+            gpio_number: Some(gpio_number),
+            direction: GpioDirection::Input,
+            point_id,
+            active_low: false,
+            debounce_us: Some(1000),
+        }
+    }
+
+    /// Create a digital output configuration for sysfs driver.
+    pub fn digital_output_sysfs(gpio_number: u32, point_id: u32) -> Self {
+        Self {
+            chip: String::new(),
+            pin: 0,
+            gpio_number: Some(gpio_number),
+            direction: GpioDirection::Output,
+            point_id,
+            active_low: false,
+            debounce_us: None,
+        }
+    }
+
+    /// Set GPIO number (for sysfs driver or dual-mode configuration).
+    pub fn with_gpio_number(mut self, gpio_number: u32) -> Self {
+        self.gpio_number = Some(gpio_number);
+        self
     }
 
     /// Set active low mode.
@@ -115,8 +477,11 @@ impl GpioPinConfig {
 }
 
 /// GPIO channel configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GpioChannelConfig {
+    /// Driver type selection.
+    pub driver: GpioDriverType,
+
     /// Pin configurations.
     pub pins: Vec<GpioPinConfig>,
 
@@ -124,13 +489,37 @@ pub struct GpioChannelConfig {
     pub poll_interval: Duration,
 }
 
-impl GpioChannelConfig {
-    /// Create a new configuration.
-    pub fn new() -> Self {
+impl Default for GpioChannelConfig {
+    fn default() -> Self {
         Self {
+            driver: GpioDriverType::default(),
             pins: Vec::new(),
             poll_interval: Duration::from_millis(100),
         }
+    }
+}
+
+impl GpioChannelConfig {
+    /// Create a new configuration with default gpiod driver.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new configuration with sysfs driver.
+    pub fn new_sysfs(base_path: impl Into<String>) -> Self {
+        Self {
+            driver: GpioDriverType::Sysfs {
+                base_path: base_path.into(),
+            },
+            pins: Vec::new(),
+            poll_interval: Duration::from_millis(100),
+        }
+    }
+
+    /// Set the driver type.
+    pub fn with_driver(mut self, driver: GpioDriverType) -> Self {
+        self.driver = driver;
+        self
     }
 
     /// Add a pin configuration.
@@ -171,29 +560,65 @@ struct GpioDiagnostics {
 
 /// GPIO channel adapter.
 ///
-/// This is a stub implementation. The actual GPIO operations require
-/// platform-specific libraries (gpiod on Linux).
+/// Provides digital input/output control via pluggable GPIO drivers.
+/// Supports both modern gpiod (chardev) and legacy sysfs backends.
 ///
 /// The service layer (comsrv) is responsible for persistence.
 pub struct GpioChannel {
     config: GpioChannelConfig,
+    /// Pluggable GPIO driver (trait object for extensibility)
+    driver: Box<dyn GpioDriver>,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<GpioDiagnostics>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
-    // Output states cache (for read-back)
+    /// Output states cache (for read-back)
     output_states: Arc<RwLock<std::collections::HashMap<u32, bool>>>,
+    /// Logging context
+    log_ctx: LogContext,
 }
 
 impl GpioChannel {
-    /// Create a new GPIO channel.
+    /// Create a new GPIO channel with the configured driver.
     pub fn new(config: GpioChannelConfig) -> Self {
+        // Create driver based on configuration
+        let driver: Box<dyn GpioDriver> = match &config.driver {
+            GpioDriverType::Gpiod => Box::new(GpiodDriver::new()),
+            GpioDriverType::Sysfs { base_path } => Box::new(SysfsDriver::new(base_path.clone())),
+        };
         Self {
             config,
+            driver,
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
             output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            log_ctx: LogContext::new(0), // channel_id set later
         }
+    }
+
+    /// Create a GPIO channel with a custom driver.
+    ///
+    /// This allows using custom driver implementations beyond the built-in ones.
+    pub fn with_driver(config: GpioChannelConfig, driver: Box<dyn GpioDriver>) -> Self {
+        Self {
+            config,
+            driver,
+            state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
+            diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
+            poll_task: None,
+            output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            log_ctx: LogContext::new(0),
+        }
+    }
+
+    /// Get the driver name.
+    pub fn driver_name(&self) -> &'static str {
+        self.driver.name()
+    }
+
+    /// Set the channel ID for logging (called by service layer).
+    pub fn set_channel_id(&mut self, channel_id: u32) {
+        self.log_ctx = LogContext::new(channel_id);
     }
 
     fn set_state(&self, state: ConnectionState) {
@@ -209,60 +634,21 @@ impl GpioChannel {
             .unwrap_or(ConnectionState::Error)
     }
 
-    /// Read a single GPIO pin using tokio-gpiod.
+    /// Read a single GPIO pin using the configured driver.
     async fn read_pin(&self, pin_config: &GpioPinConfig) -> Result<DataPoint> {
-        let chip = Chip::new(&pin_config.chip).await.map_err(|e| {
-            GatewayError::Protocol(format!(
-                "Failed to open GPIO chip '{}': {}",
-                pin_config.chip, e
-            ))
-        })?;
-
-        let opts = Options::input([pin_config.pin]).consumer("igw");
-        let lines = chip.request_lines(opts).await.map_err(|e| {
-            GatewayError::Protocol(format!(
-                "Failed to request GPIO line {} on chip '{}': {}",
-                pin_config.pin, pin_config.chip, e
-            ))
-        })?;
-
-        let values = lines.get_values([false]).await.map_err(|e| {
-            GatewayError::Protocol(format!("Failed to read GPIO pin {}: {}", pin_config.pin, e))
-        })?;
-
-        let value = values[0];
-        let adjusted = if pin_config.active_low { !value } else { value };
-
+        let raw_value = self.driver.read_pin(pin_config).await?;
+        let adjusted = if pin_config.active_low {
+            !raw_value
+        } else {
+            raw_value
+        };
         Ok(DataPoint::signal(pin_config.point_id, adjusted))
     }
 
-    /// Write to a single GPIO pin using tokio-gpiod.
+    /// Write to a single GPIO pin using the configured driver.
     async fn write_pin(&self, pin_config: &GpioPinConfig, value: bool) -> Result<()> {
         let adjusted = if pin_config.active_low { !value } else { value };
-
-        let chip = Chip::new(&pin_config.chip).await.map_err(|e| {
-            GatewayError::Protocol(format!(
-                "Failed to open GPIO chip '{}': {}",
-                pin_config.chip, e
-            ))
-        })?;
-
-        let opts = Options::output([pin_config.pin])
-            .consumer("igw")
-            .values([adjusted]);
-        let lines = chip.request_lines(opts).await.map_err(|e| {
-            GatewayError::Protocol(format!(
-                "Failed to request GPIO line {} on chip '{}': {}",
-                pin_config.pin, pin_config.chip, e
-            ))
-        })?;
-
-        lines.set_values([adjusted]).await.map_err(|e| {
-            GatewayError::Protocol(format!(
-                "Failed to write GPIO pin {}: {}",
-                pin_config.pin, e
-            ))
-        })?;
+        self.driver.write_pin(pin_config, adjusted).await?;
 
         // Update internal state cache for feedback
         self.output_states
@@ -286,6 +672,20 @@ impl ProtocolCapabilities for GpioChannel {
 
     fn supported_modes(&self) -> &[CommunicationMode] {
         &[CommunicationMode::Polling]
+    }
+}
+
+impl LoggableProtocol for GpioChannel {
+    fn set_log_handler(&mut self, handler: Arc<dyn ChannelLogHandler>) {
+        self.log_ctx.set_handler(handler);
+    }
+
+    fn set_log_config(&mut self, config: ChannelLogConfig) {
+        self.log_ctx.set_config(config);
+    }
+
+    fn log_config(&self) -> &ChannelLogConfig {
+        self.log_ctx.config()
     }
 }
 
@@ -364,8 +764,12 @@ impl Protocol for GpioChannel {
 
 impl ProtocolClient for GpioChannel {
     async fn connect(&mut self) -> Result<()> {
+        let start = Instant::now();
         // In a real implementation, validate GPIO chips and pins exist
         self.set_state(ConnectionState::Connected);
+        self.log_ctx
+            .log_connected("gpio", start.elapsed().as_millis() as u64)
+            .await;
         Ok(())
     }
 
@@ -374,15 +778,31 @@ impl ProtocolClient for GpioChannel {
             task.abort();
         }
         self.set_state(ConnectionState::Disconnected);
+        self.log_ctx.log_disconnected(None).await;
         Ok(())
     }
 
     async fn poll_once(&mut self) -> Result<DataBatch> {
+        let start = Instant::now();
         let response = self.read(ReadRequest::all()).await?;
-        Ok(response.data)
+        let batch = response.data;
+
+        // Log poll cycle
+        self.log_ctx
+            .log_poll_cycle(
+                batch.clone(),
+                start.elapsed().as_millis() as u64,
+                batch.len(),
+                0,
+            )
+            .await;
+
+        Ok(batch)
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
+        let start = Instant::now();
+
         if !self.get_state().is_connected() {
             return Err(GatewayError::NotConnected);
         }
@@ -414,10 +834,21 @@ impl ProtocolClient for GpioChannel {
             diag.write_count += success_count as u64;
         }
 
-        Ok(WriteResult {
+        let result = WriteResult {
             success_count,
             failures,
-        })
+        };
+
+        // Log control write
+        self.log_ctx
+            .log_control_write(
+                commands.to_vec(),
+                Ok(result.clone()),
+                start.elapsed().as_millis() as u64,
+            )
+            .await;
+
+        Ok(result)
     }
 
     async fn write_adjustment(
