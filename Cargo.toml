@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.85"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
@@ -64,6 +64,9 @@ bytes = "1"
 
 # Concurrent data structures
 dashmap = "6"
+
+# Lazy static initialization
+once_cell = "1"
 
 # Optional: Serial port support
 tokio-serial = { version = "5", optional = true }

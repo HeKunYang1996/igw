@@ -60,6 +60,10 @@ pub use crate::core::logging::{
     ChannelLogConfig, ChannelLogEvent, ChannelLogHandler, LogContext, LogEventType, LogVerbosity,
     LoggableProtocol, PacketDirection, PacketMetadata,
 };
+pub use crate::core::metadata::{
+    get_protocol_registry, DriverMetadata, HasMetadata, ParameterMetadata, ParameterType,
+    ProtocolMetadata, ProtocolRegistry,
+};
 pub use crate::core::quality::Quality;
 pub use crate::core::traits::{
     CommunicationMode, ConnectionState, Protocol, ProtocolCapabilities, ProtocolClient,

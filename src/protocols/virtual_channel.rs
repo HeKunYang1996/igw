@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::Result;
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
 use crate::core::point::PointConfig;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
@@ -175,6 +176,44 @@ impl VirtualChannel {
             batch.add(entry.value().clone());
         }
         batch
+    }
+}
+
+impl HasMetadata for VirtualChannel {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "virtual",
+            display_name: "Virtual Channel",
+            description: "Virtual channel for data aggregation, testing, and simulation. Does not connect to physical devices.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "name": "virtual_hub",
+                "buffer_size": 1000,
+                "mode": "aggregation"
+            }),
+            parameters: vec![
+                ParameterMetadata::required(
+                    "name",
+                    "Name",
+                    "Virtual channel name for identification",
+                    ParameterType::String,
+                ),
+                ParameterMetadata::optional(
+                    "buffer_size",
+                    "Buffer Size",
+                    "Maximum number of data points to buffer",
+                    ParameterType::Integer,
+                    serde_json::json!(1000),
+                ),
+                ParameterMetadata::optional(
+                    "mode",
+                    "Mode",
+                    "Channel mode: 'aggregation' or 'simulation'",
+                    ParameterType::String,
+                    serde_json::json!("aggregation"),
+                ),
+            ],
+        }
     }
 }
 

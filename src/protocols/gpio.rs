@@ -65,6 +65,7 @@ use tokio_gpiod::{Chip, Options};
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
 use crate::core::logging::{ChannelLogConfig, ChannelLogHandler, LogContext, LoggableProtocol};
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
@@ -159,6 +160,55 @@ impl GpiodDriver {
     /// Create a new gpiod driver.
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl HasMetadata for GpiodDriver {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "gpiod",
+            display_name: "Gpiod (Recommended)",
+            description: "Modern character device interface using /dev/gpiochipN. Recommended for new projects.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "driver": "gpiod",
+                "gpio_chip": "gpiochip6",
+                "poll_interval_ms": 200,
+                "pins": [
+                    { "chip": "gpiochip6", "pin": 0, "direction": "input", "point_id": 1 },
+                    { "chip": "gpiochip6", "pin": 1, "direction": "output", "point_id": 101 }
+                ]
+            }),
+            parameters: vec![
+                ParameterMetadata::optional(
+                    "driver",
+                    "Driver",
+                    "GPIO driver type: 'gpiod' or 'sysfs'",
+                    ParameterType::String,
+                    serde_json::json!("gpiod"),
+                ),
+                ParameterMetadata::optional(
+                    "gpio_chip",
+                    "GPIO Chip",
+                    "Default GPIO chip device name (e.g., gpiochip0, gpiochip6)",
+                    ParameterType::String,
+                    serde_json::json!("gpiochip0"),
+                ),
+                ParameterMetadata::optional(
+                    "poll_interval_ms",
+                    "Poll Interval (ms)",
+                    "Polling interval for input pins in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(200),
+                ),
+                ParameterMetadata::required(
+                    "pins",
+                    "Pin Configuration",
+                    "Array of GPIO pin configurations with chip, pin, direction, and point_id",
+                    ParameterType::Array,
+                ),
+            ],
+        }
     }
 }
 
@@ -292,6 +342,55 @@ impl SysfsDriver {
             })?;
 
         Ok(())
+    }
+}
+
+impl HasMetadata for SysfsDriver {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "sysfs",
+            display_name: "Sysfs (Legacy)",
+            description: "Legacy sysfs interface using /sys/class/gpio/. For compatibility with older systems.",
+            is_recommended: false,
+            example_config: serde_json::json!({
+                "driver": "sysfs",
+                "gpio_base_path": "/sys/class/gpio",
+                "poll_interval_ms": 200,
+                "pins": [
+                    { "gpio_number": 490, "direction": "input", "point_id": 1 },
+                    { "gpio_number": 491, "direction": "output", "point_id": 101 }
+                ]
+            }),
+            parameters: vec![
+                ParameterMetadata::optional(
+                    "driver",
+                    "Driver",
+                    "GPIO driver type: 'gpiod' or 'sysfs'",
+                    ParameterType::String,
+                    serde_json::json!("sysfs"),
+                ),
+                ParameterMetadata::optional(
+                    "gpio_base_path",
+                    "GPIO Base Path",
+                    "Base path for sysfs GPIO interface",
+                    ParameterType::String,
+                    serde_json::json!("/sys/class/gpio"),
+                ),
+                ParameterMetadata::optional(
+                    "poll_interval_ms",
+                    "Poll Interval (ms)",
+                    "Polling interval for input pins in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(200),
+                ),
+                ParameterMetadata::required(
+                    "pins",
+                    "Pin Configuration",
+                    "Array of GPIO pin configurations with gpio_number, direction, and point_id",
+                    ParameterType::Array,
+                ),
+            ],
+        }
     }
 }
 

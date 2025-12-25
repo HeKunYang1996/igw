@@ -40,6 +40,7 @@ use crate::core::error::{GatewayError, Result};
 use crate::core::logging::{
     ChannelLogConfig, ChannelLogHandler, ErrorContext, LogContext, LoggableProtocol,
 };
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
 use crate::core::point::{DataFormat, PointConfig, ProtocolAddress};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
@@ -853,6 +854,84 @@ impl ModbusChannel {
         }
 
         Ok(results)
+    }
+}
+
+impl HasMetadata for ModbusChannel {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "modbus_tcp",
+            display_name: "Modbus TCP",
+            description: "Industrial Modbus TCP protocol for reading/writing registers and coils.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "host": "192.168.1.100",
+                "port": 502,
+                "slave_id": 1,
+                "connect_timeout_ms": 5000,
+                "read_timeout_ms": 3000,
+                "polling_interval_ms": 1000,
+                "max_batch_size": 125,
+                "max_reconnect_attempts": 5
+            }),
+            parameters: vec![
+                ParameterMetadata::required(
+                    "host",
+                    "Host",
+                    "Modbus device IP address or hostname",
+                    ParameterType::String,
+                ),
+                ParameterMetadata::optional(
+                    "port",
+                    "Port",
+                    "Modbus TCP port",
+                    ParameterType::Integer,
+                    serde_json::json!(502),
+                ),
+                ParameterMetadata::optional(
+                    "slave_id",
+                    "Slave ID",
+                    "Modbus slave/unit ID (1-247)",
+                    ParameterType::Integer,
+                    serde_json::json!(1),
+                ),
+                ParameterMetadata::optional(
+                    "connect_timeout_ms",
+                    "Connect Timeout (ms)",
+                    "Connection timeout in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(5000),
+                ),
+                ParameterMetadata::optional(
+                    "read_timeout_ms",
+                    "Read Timeout (ms)",
+                    "Read operation timeout in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(3000),
+                ),
+                ParameterMetadata::optional(
+                    "polling_interval_ms",
+                    "Polling Interval (ms)",
+                    "Polling interval in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(1000),
+                ),
+                ParameterMetadata::optional(
+                    "max_batch_size",
+                    "Max Batch Size",
+                    "Maximum registers per batch read (max 125)",
+                    ParameterType::Integer,
+                    serde_json::json!(125),
+                ),
+                ParameterMetadata::optional(
+                    "max_reconnect_attempts",
+                    "Max Reconnect Attempts",
+                    "Maximum reconnection attempts before giving up",
+                    ParameterType::Integer,
+                    serde_json::json!(5),
+                ),
+            ],
+        }
     }
 }
 
