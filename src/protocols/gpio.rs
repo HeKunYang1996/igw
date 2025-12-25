@@ -4,8 +4,12 @@
 //!
 //! # Platform Support
 //!
-//! - Linux: Uses the gpiod (libgpiod) library
-//! - Other platforms: Not supported
+//! **Linux only**: Uses tokio-gpiod (libgpiod v2 character device interface).
+//! This module is not available on other platforms.
+//!
+//! # Feature Flag
+//!
+//! Requires `gpio` feature to be enabled.
 //!
 //! # Example
 //!
@@ -30,6 +34,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+
+use tokio_gpiod::{Chip, Options};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
@@ -203,31 +209,62 @@ impl GpioChannel {
             .unwrap_or(ConnectionState::Error)
     }
 
-    /// Read a single GPIO pin (stub implementation).
+    /// Read a single GPIO pin using tokio-gpiod.
     async fn read_pin(&self, pin_config: &GpioPinConfig) -> Result<DataPoint> {
-        // In a real implementation, this would use gpiod:
-        // let chip = gpiod::Chip::new(&pin_config.chip)?;
-        // let line = chip.get_line(pin_config.pin)?;
-        // let value = line.get_value()?;
+        let chip = Chip::new(&pin_config.chip).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to open GPIO chip '{}': {}",
+                pin_config.chip, e
+            ))
+        })?;
 
-        // Stub: return false for inputs
-        let value = false;
+        let opts = Options::input([pin_config.pin]).consumer("igw");
+        let lines = chip.request_lines(opts).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to request GPIO line {} on chip '{}': {}",
+                pin_config.pin, pin_config.chip, e
+            ))
+        })?;
+
+        let values = lines.get_values([false]).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to read GPIO pin {}: {}", pin_config.pin, e))
+        })?;
+
+        let value = values[0];
         let adjusted = if pin_config.active_low { !value } else { value };
 
         Ok(DataPoint::signal(&pin_config.point_id, adjusted))
     }
 
-    /// Write to a single GPIO pin (stub implementation).
+    /// Write to a single GPIO pin using tokio-gpiod.
     async fn write_pin(&self, pin_config: &GpioPinConfig, value: bool) -> Result<()> {
-        // In a real implementation, this would use gpiod:
-        // let chip = gpiod::Chip::new(&pin_config.chip)?;
-        // let line = chip.get_line(pin_config.pin)?;
-        // let adjusted = if pin_config.active_low { !value } else { value };
-        // line.request(gpiod::LineRequestFlags::OUTPUT, adjusted as u8, "igw")?;
-        // line.set_value(adjusted as u8)?;
-
-        // Store the output state
         let adjusted = if pin_config.active_low { !value } else { value };
+
+        let chip = Chip::new(&pin_config.chip).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to open GPIO chip '{}': {}",
+                pin_config.chip, e
+            ))
+        })?;
+
+        let opts = Options::output([pin_config.pin])
+            .consumer("igw")
+            .values([adjusted]);
+        let lines = chip.request_lines(opts).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to request GPIO line {} on chip '{}': {}",
+                pin_config.pin, pin_config.chip, e
+            ))
+        })?;
+
+        lines.set_values([adjusted]).await.map_err(|e| {
+            GatewayError::Protocol(format!(
+                "Failed to write GPIO pin {}: {}",
+                pin_config.pin, e
+            ))
+        })?;
+
+        // Update internal state cache for feedback
         self.output_states
             .write()
             .await
