@@ -377,6 +377,11 @@ impl ProtocolClient for GpioChannel {
         Ok(())
     }
 
+    async fn poll_once(&mut self) -> Result<DataBatch> {
+        let response = self.read(ReadRequest::all()).await?;
+        Ok(response.data)
+    }
+
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         if !self.get_state().is_connected() {
             return Err(GatewayError::NotConnected);
