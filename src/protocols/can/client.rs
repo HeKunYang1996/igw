@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket, SocketOptions};
+use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
-use crate::core::quality::Quality;
+
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,

@@ -32,7 +32,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 use voltage_modbus::{ModbusClient, ModbusTcpClient};
 
-#[cfg(feature = "modbus-rtu")]
+#[cfg(feature = "modbus")]
 use voltage_modbus::ModbusRtuClient;
 
 use crate::core::data::{DataBatch, DataPoint, DataType, Value};
@@ -131,7 +131,7 @@ pub enum ConnectionMode {
     #[default]
     Tcp,
     /// RTU serial port connection
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     Rtu,
 }
 
@@ -143,7 +143,7 @@ pub enum ModbusClientWrapper {
     /// TCP client
     Tcp(ModbusTcpClient),
     /// RTU client (requires `modbus-rtu` feature)
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     Rtu(ModbusRtuClient),
 }
 
@@ -157,7 +157,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<Vec<bool>> {
         match self {
             Self::Tcp(client) => client.read_01(slave_id, address, quantity).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.read_01(slave_id, address, quantity).await,
         }
     }
@@ -171,7 +171,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<Vec<bool>> {
         match self {
             Self::Tcp(client) => client.read_02(slave_id, address, quantity).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.read_02(slave_id, address, quantity).await,
         }
     }
@@ -185,7 +185,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<Vec<u16>> {
         match self {
             Self::Tcp(client) => client.read_03(slave_id, address, quantity).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.read_03(slave_id, address, quantity).await,
         }
     }
@@ -199,7 +199,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<Vec<u16>> {
         match self {
             Self::Tcp(client) => client.read_04(slave_id, address, quantity).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.read_04(slave_id, address, quantity).await,
         }
     }
@@ -213,7 +213,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<()> {
         match self {
             Self::Tcp(client) => client.write_05(slave_id, address, value).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.write_05(slave_id, address, value).await,
         }
     }
@@ -227,7 +227,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<()> {
         match self {
             Self::Tcp(client) => client.write_06(slave_id, address, value).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.write_06(slave_id, address, value).await,
         }
     }
@@ -241,7 +241,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<()> {
         match self {
             Self::Tcp(client) => client.write_0f(slave_id, address, values).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.write_0f(slave_id, address, values).await,
         }
     }
@@ -255,7 +255,7 @@ impl ModbusClientWrapper {
     ) -> voltage_modbus::ModbusResult<()> {
         match self {
             Self::Tcp(client) => client.write_10(slave_id, address, values).await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.write_10(slave_id, address, values).await,
         }
     }
@@ -264,7 +264,7 @@ impl ModbusClientWrapper {
     pub async fn close(&mut self) -> voltage_modbus::ModbusResult<()> {
         match self {
             Self::Tcp(client) => client.close().await,
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             Self::Rtu(client) => client.close().await,
         }
     }
@@ -286,11 +286,11 @@ pub struct ModbusChannelConfig {
     pub io_timeout: Duration,
 
     /// RTU serial device path (e.g., "/dev/ttyUSB0")
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     pub rtu_device: String,
 
     /// RTU baud rate (e.g., 9600, 19200, 115200)
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     pub baud_rate: u32,
 
     /// Point configurations
@@ -314,9 +314,9 @@ impl ModbusChannelConfig {
             address: address.into(),
             connect_timeout: Duration::from_secs(5),
             io_timeout: Duration::from_secs(3),
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             rtu_device: String::new(),
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             baud_rate: 9600,
             points: Vec::new(),
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
@@ -337,7 +337,7 @@ impl ModbusChannelConfig {
     /// ```rust,ignore
     /// let config = ModbusChannelConfig::rtu("/dev/ttyUSB0", 9600);
     /// ```
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     pub fn rtu(device: impl Into<String>, baud_rate: u32) -> Self {
         Self {
             connection_mode: ConnectionMode::Rtu,
@@ -1169,7 +1169,7 @@ impl ProtocolCapabilities for ModbusChannel {
     fn name(&self) -> &'static str {
         match self.config.connection_mode {
             ConnectionMode::Tcp => "Modbus TCP",
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             ConnectionMode::Rtu => "Modbus RTU",
         }
     }
@@ -1256,7 +1256,7 @@ impl ProtocolClient for ModbusChannel {
         // Get endpoint for logging
         let endpoint = match self.config.connection_mode {
             ConnectionMode::Tcp => self.config.address.clone(),
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             ConnectionMode::Rtu => {
                 format!("{}@{}", self.config.rtu_device, self.config.baud_rate)
             }
@@ -1276,7 +1276,7 @@ impl ProtocolClient for ModbusChannel {
                     Err(e) => Err(GatewayError::Connection(e.to_string())),
                 }
             }
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             ConnectionMode::Rtu => {
                 // RTU serial connection
                 match ModbusRtuClient::new(&self.config.rtu_device, self.config.baud_rate) {
@@ -1704,15 +1704,15 @@ impl ProtocolClient for ModbusChannel {
         let target_address = self.config.address.clone();
         let connect_timeout = self.config.connect_timeout;
         let connection_mode = self.config.connection_mode;
-        #[cfg(feature = "modbus-rtu")]
+        #[cfg(feature = "modbus")]
         let rtu_device = self.config.rtu_device.clone();
-        #[cfg(feature = "modbus-rtu")]
+        #[cfg(feature = "modbus")]
         let baud_rate = self.config.baud_rate;
 
         // Build display name for logging
         let display_name = match connection_mode {
             ConnectionMode::Tcp => target_address.clone(),
-            #[cfg(feature = "modbus-rtu")]
+            #[cfg(feature = "modbus")]
             ConnectionMode::Rtu => format!("{}@{}", rtu_device, baud_rate),
         };
 
@@ -1781,7 +1781,7 @@ impl ProtocolClient for ModbusChannel {
                                         Err(e) => Err(e.to_string()),
                                     }
                                 }
-                                #[cfg(feature = "modbus-rtu")]
+                                #[cfg(feature = "modbus")]
                                 ConnectionMode::Rtu => {
                                     match ModbusRtuClient::new(&rtu_device, baud_rate) {
                                         Ok(client) => Ok(ModbusClientWrapper::Rtu(client)),
@@ -2020,7 +2020,7 @@ mod tests {
         assert_eq!(channel.name(), "Modbus TCP");
     }
 
-    #[cfg(feature = "modbus-rtu")]
+    #[cfg(feature = "modbus")]
     #[test]
     fn test_rtu_config() {
         let config = ModbusChannelConfig::rtu("/dev/ttyUSB0", 9600);

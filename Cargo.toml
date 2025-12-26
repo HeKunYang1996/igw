@@ -19,9 +19,7 @@ required-features = ["cli"]
 default = []
 
 # Protocol support
-modbus = ["modbus-tcp"]  # Backward compatible alias
-modbus-tcp = ["dep:voltage_modbus", "tracing-support"]
-modbus-rtu = ["modbus-tcp", "voltage_modbus/rtu"]
+modbus = ["dep:voltage_modbus", "voltage_modbus/rtu", "tracing-support"]  # TCP + RTU
 iec104 = ["dep:voltage_iec104"]
 can = ["dep:socketcan", "tracing-support"]  # LYNK CAN protocol
 j1939 = ["can", "dep:voltage_j1939"]  # J1939 is a CAN-based protocol
@@ -43,7 +41,7 @@ tracing-support = ["dep:tracing"]
 cli = ["dep:clap", "dep:toml"]
 
 # Full feature set
-full = ["modbus-tcp", "modbus-rtu", "iec104", "j1939", "can", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
+full = ["modbus", "iec104", "j1939", "can", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
 
 [dependencies]
 # Core async runtime

@@ -82,24 +82,9 @@ impl CanFrameCache {
         self.frames.get(&can_id).map(|v| v.as_slice())
     }
 
-    /// Check if a CAN-ID has been received
-    pub fn contains(&self, can_id: u32) -> bool {
-        self.frames.contains_key(&can_id)
-    }
-
-    /// Get all cached CAN-IDs
-    pub fn can_ids(&self) -> Vec<u32> {
-        self.frames.keys().copied().collect()
-    }
-
     /// Get number of cached CAN-IDs
     pub fn len(&self) -> usize {
         self.frames.len()
-    }
-
-    /// Check if cache is empty
-    pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
     }
 
     /// Get all frames (for debugging)

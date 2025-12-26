@@ -63,14 +63,6 @@ impl PointManager {
 
         Ok(result)
     }
-
-    /// Get points for a specific CAN-ID
-    pub fn get_points_for_can_id(&self, can_id: u32) -> Vec<&CanPoint> {
-        self.points_by_can_id
-            .get(&can_id)
-            .map(|ids| ids.iter().filter_map(|id| self.points.get(id)).collect())
-            .unwrap_or_default()
-    }
 }
 
 /// Extract a field from CAN data
