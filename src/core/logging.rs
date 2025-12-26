@@ -1000,7 +1000,14 @@ impl ChannelLogHandler for TracingLogHandler {
                 metadata,
                 ..
             } => {
-                let hex: String = data.iter().take(32).map(|b| format!("{:02X}", b)).collect();
+                let hex = data
+                    .iter()
+                    .take(32)
+                    .fold(String::with_capacity(64), |mut s, b| {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{:02X}", b);
+                        s
+                    });
                 trace!(
                     channel_id = channel_id,
                     protocol = metadata.protocol_name(),
