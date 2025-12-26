@@ -25,6 +25,10 @@ pub mod opcua;
 #[cfg_attr(docsrs, doc(cfg(all(feature = "j1939", target_os = "linux"))))]
 pub mod j1939;
 
+#[cfg(all(feature = "can", target_os = "linux"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "can", target_os = "linux"))))]
+pub mod can;
+
 #[cfg(all(feature = "gpio", target_os = "linux"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "gpio", target_os = "linux"))))]
 pub mod gpio;

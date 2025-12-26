@@ -24,6 +24,7 @@ modbus-tcp = ["dep:voltage_modbus", "tracing-support"]
 modbus-rtu = ["modbus-tcp", "voltage_modbus/rtu"]
 iec104 = ["dep:voltage_iec104"]
 j1939 = ["dep:socketcan", "dep:voltage_j1939"]
+can = ["dep:socketcan", "tracing-support"]  # LYNK CAN protocol
 opcua = ["dep:async-opcua"]
 
 # Virtual channel (no external deps)
@@ -42,12 +43,13 @@ tracing-support = ["dep:tracing"]
 cli = ["dep:clap", "dep:toml"]
 
 # Full feature set
-full = ["modbus-tcp", "modbus-rtu", "iec104", "j1939", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
+full = ["modbus-tcp", "modbus-rtu", "iec104", "j1939", "can", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
 
 [dependencies]
 # Core async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 async-trait = "0.1"
+futures = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +63,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Byte manipulation
 bytes = "1"
+
+# CSV parsing (for CAN protocol)
+csv = "1"
 
 # Concurrent data structures
 dashmap = "6"
