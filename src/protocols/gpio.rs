@@ -667,6 +667,11 @@ impl GpioChannel {
         self.driver.name()
     }
 
+    /// Get the configured poll interval.
+    pub fn poll_interval(&self) -> Duration {
+        self.config.poll_interval
+    }
+
     /// Set the channel ID for logging (called by service layer).
     pub fn set_channel_id(&mut self, channel_id: u32) {
         self.log_ctx = LogContext::new(channel_id);
