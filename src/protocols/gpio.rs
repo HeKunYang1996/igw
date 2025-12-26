@@ -64,7 +64,9 @@ use tokio_gpiod::{Chip, Options};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
-use crate::core::logging::{ChannelLogConfig, ChannelLogHandler, LogContext, LoggableProtocol};
+use crate::core::logging::{
+    ChannelLogConfig, ChannelLogHandler, ErrorContext, LogContext, LoggableProtocol,
+};
 use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
@@ -756,6 +758,7 @@ impl Protocol for GpioChannel {
         }
 
         let mut batch = DataBatch::new();
+        let mut errors = Vec::new(); // Collect partial read errors
 
         // Read all input pins
         for pin in self.config.input_pins() {
@@ -769,6 +772,9 @@ impl Protocol for GpioChannel {
             match self.read_pin(pin).await {
                 Ok(point) => batch.add(point),
                 Err(e) => {
+                    // Record error with point_id for transparency
+                    errors.push((pin.point_id, e.to_string()));
+                    // Also update diagnostics for backward compatibility
                     let mut diag = self.diagnostics.write().await;
                     diag.error_count += 1;
                     diag.last_error = Some(e.to_string());
@@ -794,8 +800,8 @@ impl Protocol for GpioChannel {
             diag.read_count += 1;
         }
 
-        // Return batch directly (service layer handles storage)
-        Ok(ReadResponse::success(batch))
+        // Return response with error details
+        Ok(ReadResponse::with_errors(batch, errors))
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
@@ -841,15 +847,31 @@ impl ProtocolClient for GpioChannel {
     async fn poll_once(&mut self) -> Result<DataBatch> {
         let start = Instant::now();
         let response = self.read(ReadRequest::all()).await?;
+
+        // Log error summary (avoids log flooding with many failed pins)
+        if let Some((count, first_errors)) = response.error_summary() {
+            let error_msg = if first_errors.is_empty() {
+                format!("GPIO read: {} point(s) failed", count)
+            } else {
+                format!(
+                    "GPIO read: {} point(s) failed, first errors: {:?}",
+                    count, first_errors
+                )
+            };
+            self.log_ctx
+                .log_error(error_msg, ErrorContext::Polling)
+                .await;
+        }
+
         let batch = response.data;
 
-        // Log poll cycle
+        // Log poll cycle with actual error count
         self.log_ctx
             .log_poll_cycle(
                 batch.clone(),
                 start.elapsed().as_millis() as u64,
                 batch.len(),
-                0,
+                response.failed_count,
             )
             .await;
 

@@ -133,23 +133,71 @@ pub struct ReadResponse {
 
     /// Number of points that failed to read.
     pub failed_count: usize,
+
+    /// Detailed partial read failures: (point_id, error_message).
+    ///
+    /// This allows callers to know exactly which points failed and why,
+    /// rather than just a count.
+    pub partial_errors: Vec<(u32, String)>,
 }
 
 impl ReadResponse {
-    /// Create a successful response.
+    /// Create a successful response with no errors.
     pub fn success(data: DataBatch) -> Self {
         Self {
             data,
             failed_count: 0,
+            partial_errors: Vec::new(),
         }
     }
 
-    /// Create a response with partial failures.
+    /// Create a response with partial failures (count only, for backward compat).
     pub fn partial(data: DataBatch, failed: usize) -> Self {
         Self {
             data,
             failed_count: failed,
+            partial_errors: Vec::new(),
         }
+    }
+
+    /// Create a response with detailed error information.
+    pub fn with_errors(data: DataBatch, errors: Vec<(u32, String)>) -> Self {
+        let failed_count = errors.len();
+        Self {
+            data,
+            failed_count,
+            partial_errors: errors,
+        }
+    }
+
+    /// Check if any reads failed.
+    ///
+    /// Returns true if either:
+    /// - `failed_count > 0` (from partial() or with_errors())
+    /// - `partial_errors` is not empty
+    pub fn has_errors(&self) -> bool {
+        self.failed_count > 0 || !self.partial_errors.is_empty()
+    }
+
+    /// Get a summary of errors suitable for logging.
+    ///
+    /// Returns `Some((total_count, first_few_errors))` if there are errors,
+    /// where first_few_errors contains at most 3 error messages.
+    /// Returns `None` if no errors.
+    pub fn error_summary(&self) -> Option<(usize, Vec<&str>)> {
+        if !self.has_errors() {
+            return None;
+        }
+
+        let count = self.failed_count.max(self.partial_errors.len());
+        let first_few: Vec<&str> = self
+            .partial_errors
+            .iter()
+            .take(3)
+            .map(|(_, msg)| msg.as_str())
+            .collect();
+
+        Some((count, first_few))
     }
 }
 
@@ -453,5 +501,55 @@ mod tests {
 
         let cmd = ControlCommand::pulse(1, true, 500);
         assert_eq!(cmd.pulse_duration_ms, Some(500));
+    }
+
+    #[test]
+    fn test_read_response_success() {
+        let batch = DataBatch::new();
+        let resp = ReadResponse::success(batch);
+        assert!(!resp.has_errors());
+        assert!(resp.error_summary().is_none());
+    }
+
+    #[test]
+    fn test_read_response_with_errors() {
+        let batch = DataBatch::new();
+        let errors = vec![(1, "error 1".to_string()), (2, "error 2".to_string())];
+        let resp = ReadResponse::with_errors(batch, errors);
+
+        assert!(resp.has_errors());
+        assert_eq!(resp.failed_count, 2);
+        assert_eq!(resp.partial_errors.len(), 2);
+
+        let summary = resp.error_summary().unwrap();
+        assert_eq!(summary.0, 2); // count
+        assert_eq!(summary.1.len(), 2); // first 2 errors
+    }
+
+    #[test]
+    fn test_read_response_error_summary_limits() {
+        let batch = DataBatch::new();
+        let errors: Vec<_> = (0..10).map(|i| (i, format!("error {}", i))).collect();
+        let resp = ReadResponse::with_errors(batch, errors);
+
+        let summary = resp.error_summary().unwrap();
+        assert_eq!(summary.0, 10); // total count
+        assert_eq!(summary.1.len(), 3); // only first 3
+    }
+
+    #[test]
+    fn test_read_response_partial_backward_compat() {
+        // partial() sets failed_count but no error details
+        let batch = DataBatch::new();
+        let resp = ReadResponse::partial(batch, 5);
+
+        assert!(resp.has_errors());
+        assert_eq!(resp.failed_count, 5);
+        assert!(resp.partial_errors.is_empty());
+
+        // error_summary should still work
+        let summary = resp.error_summary().unwrap();
+        assert_eq!(summary.0, 5); // count from failed_count
+        assert!(summary.1.is_empty()); // no details
     }
 }
