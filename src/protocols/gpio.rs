@@ -149,15 +149,23 @@ fn default_gpio_chip() -> String {
 
 impl GpioMappingConfig {
     /// Convert to igw GpioPinConfig for input (DI).
+    ///
+    /// If `gpio_chip` is "gpiochip0" (default) and `gpio_number` >= 32,
+    /// the driver will auto-resolve the global GPIO number to the correct chip.
     pub fn to_input_pin_config(&self, point_id: u32) -> GpioPinConfig {
         GpioPinConfig::digital_input(&self.gpio_chip, self.gpio_number, point_id)
+            .with_gpio_number(self.gpio_number) // Enable auto-resolution
             .with_active_low(self.active_low)
             .with_debounce(self.debounce_us)
     }
 
     /// Convert to igw GpioPinConfig for output (DO).
+    ///
+    /// If `gpio_chip` is "gpiochip0" (default) and `gpio_number` >= 32,
+    /// the driver will auto-resolve the global GPIO number to the correct chip.
     pub fn to_output_pin_config(&self, point_id: u32) -> GpioPinConfig {
         GpioPinConfig::digital_output(&self.gpio_chip, self.gpio_number, point_id)
+            .with_gpio_number(self.gpio_number) // Enable auto-resolution
             .with_active_low(self.active_low)
     }
 }
@@ -269,18 +277,132 @@ pub trait GpioDriver: Send + Sync {
 }
 
 // ============================================================================
+// GPIO Number Resolution (Global → Chip + Line)
+// ============================================================================
+
+/// GPIO chip information for mapping global numbers to chip + line.
+#[derive(Debug, Clone)]
+struct GpioChipInfo {
+    /// Chip name (e.g., "gpiochip495")
+    name: String,
+    /// Base GPIO number
+    base: u32,
+    /// Number of lines
+    ngpio: u32,
+}
+
+/// Resolve a global GPIO number to chip name and line offset.
+///
+/// Scans `/sys/class/gpio/gpiochipN` directories to find the chip containing
+/// the given GPIO number.
+///
+/// # Example
+/// ```text
+/// Global GPIO 503 on a system with:
+///   gpiochip495: base=495, ngpio=16
+/// Resolves to: ("gpiochip495", 8)  // 503 - 495 = 8
+/// ```
+fn resolve_gpio_to_chip_line(gpio_number: u32) -> Result<(String, u32)> {
+    let gpio_path = std::path::Path::new("/sys/class/gpio");
+
+    if !gpio_path.exists() {
+        return Err(GatewayError::Protocol(
+            "GPIO sysfs not available at /sys/class/gpio".into(),
+        ));
+    }
+
+    let mut chips: Vec<GpioChipInfo> = Vec::new();
+
+    // Scan all gpiochipN directories
+    if let Ok(entries) = std::fs::read_dir(gpio_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("gpiochip") {
+                continue;
+            }
+
+            let chip_path = entry.path();
+
+            // Read base
+            let base_path = chip_path.join("base");
+            let base: u32 = std::fs::read_to_string(&base_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+
+            // Read ngpio
+            let ngpio_path = chip_path.join("ngpio");
+            let ngpio: u32 = std::fs::read_to_string(&ngpio_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+
+            chips.push(GpioChipInfo { name, base, ngpio });
+        }
+    }
+
+    // Find the chip that contains this GPIO number
+    for chip in &chips {
+        if gpio_number >= chip.base && gpio_number < chip.base + chip.ngpio {
+            let line = gpio_number - chip.base;
+            tracing::debug!(
+                "GPIO {} resolved to chip '{}' line {} (base={}, ngpio={})",
+                gpio_number,
+                chip.name,
+                line,
+                chip.base,
+                chip.ngpio
+            );
+            return Ok((chip.name.clone(), line));
+        }
+    }
+
+    Err(GatewayError::Protocol(format!(
+        "GPIO {} not found in any chip. Available chips: {:?}",
+        gpio_number,
+        chips
+            .iter()
+            .map(|c| format!("{}(base={},n={})", c.name, c.base, c.ngpio))
+            .collect::<Vec<_>>()
+    )))
+}
+
+// ============================================================================
 // Gpiod Driver (Modern chardev interface)
 // ============================================================================
 
 /// Gpiod driver using libgpiod v2 character device interface.
 ///
 /// Uses `/dev/gpiochipN` for GPIO access. This is the recommended driver for modern Linux systems.
+///
+/// **Auto-resolution**: If `gpio_number` is provided without a specific chip,
+/// the driver will automatically resolve the global GPIO number to the correct
+/// chip and line offset by scanning `/sys/class/gpio/gpiochipN`.
 pub struct GpiodDriver;
 
 impl GpiodDriver {
     /// Create a new gpiod driver.
     pub fn new() -> Self {
         Self
+    }
+
+    /// Resolve chip and line for a pin, handling global GPIO number auto-conversion.
+    fn resolve_chip_line(pin: &GpioPinConfig) -> Result<(String, u32)> {
+        // If gpio_number is provided and chip is default/empty, auto-resolve
+        if let Some(gpio_num) = pin.gpio_number {
+            if pin.chip.is_empty() || pin.chip == "gpiochip0" {
+                // Check if it's actually on gpiochip0
+                if gpio_num < 32 {
+                    // Likely actually on gpiochip0
+                    return Ok((pin.chip.clone(), pin.pin));
+                }
+                // Auto-resolve global GPIO number to chip + line
+                return resolve_gpio_to_chip_line(gpio_num);
+            }
+        }
+
+        // Use the configured chip and pin directly
+        Ok((pin.chip.clone(), pin.pin))
     }
 }
 
@@ -346,40 +468,46 @@ impl GpioDriver for GpiodDriver {
     }
 
     async fn read_pin(&self, pin: &GpioPinConfig) -> Result<bool> {
-        let chip = Chip::new(&pin.chip).await.map_err(|e| {
-            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", pin.chip, e))
+        // Auto-resolve global GPIO number to chip + line
+        let (chip_name, line) = Self::resolve_chip_line(pin)?;
+
+        let chip = Chip::new(&chip_name).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", chip_name, e))
         })?;
 
-        let opts = Options::input([pin.pin]).consumer("igw");
+        let opts = Options::input([line]).consumer("igw");
         let lines = chip.request_lines(opts).await.map_err(|e| {
             GatewayError::Protocol(format!(
                 "Failed to request GPIO line {} on chip '{}': {}",
-                pin.pin, pin.chip, e
+                line, chip_name, e
             ))
         })?;
 
         let values = lines.get_values([false]).await.map_err(|e| {
-            GatewayError::Protocol(format!("Failed to read GPIO pin {}: {}", pin.pin, e))
+            GatewayError::Protocol(format!("Failed to read GPIO line {}: {}", line, e))
         })?;
 
         Ok(values[0])
     }
 
     async fn write_pin(&self, pin: &GpioPinConfig, value: bool) -> Result<()> {
-        let chip = Chip::new(&pin.chip).await.map_err(|e| {
-            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", pin.chip, e))
+        // Auto-resolve global GPIO number to chip + line
+        let (chip_name, line) = Self::resolve_chip_line(pin)?;
+
+        let chip = Chip::new(&chip_name).await.map_err(|e| {
+            GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", chip_name, e))
         })?;
 
-        let opts = Options::output([pin.pin]).consumer("igw").values([value]);
+        let opts = Options::output([line]).consumer("igw").values([value]);
         let lines = chip.request_lines(opts).await.map_err(|e| {
             GatewayError::Protocol(format!(
                 "Failed to request GPIO line {} on chip '{}': {}",
-                pin.pin, pin.chip, e
+                line, chip_name, e
             ))
         })?;
 
         lines.set_values([value]).await.map_err(|e| {
-            GatewayError::Protocol(format!("Failed to write GPIO pin {}: {}", pin.pin, e))
+            GatewayError::Protocol(format!("Failed to write GPIO line {}: {}", line, e))
         })?;
 
         Ok(())
