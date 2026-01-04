@@ -265,6 +265,16 @@ pub trait GpioDriver: Send + Sync {
     /// * `value` - Value to write (before active_low adjustment)
     async fn write_pin(&self, pin: &GpioPinConfig, value: bool) -> Result<()>;
 
+    /// Initialize an output pin (export and set direction to out).
+    ///
+    /// Called during connect() phase to pre-configure all output pins.
+    /// This ensures GPIO direction is set at startup, not lazily on first write.
+    ///
+    /// Default implementation does nothing (for drivers like gpiod that don't need it).
+    async fn init_output_pin(&self, _pin: &GpioPinConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Initialize the driver (optional).
     async fn init(&mut self) -> Result<()> {
         Ok(())
@@ -694,6 +704,26 @@ impl GpioDriver for SysfsDriver {
 
         Ok(())
     }
+
+    async fn init_output_pin(&self, pin: &GpioPinConfig) -> Result<()> {
+        let gpio_num = pin.gpio_number.ok_or_else(|| {
+            GatewayError::Protocol(format!(
+                "GPIO number not set for pin {} (required for sysfs driver)",
+                pin.point_id
+            ))
+        })?;
+
+        // Export and set direction to out at startup
+        self.ensure_output(gpio_num).await?;
+
+        tracing::info!(
+            gpio_num = gpio_num,
+            point_id = pin.point_id,
+            "Initialized GPIO output pin"
+        );
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1108,11 +1138,33 @@ impl Protocol for GpioChannel {
 impl ProtocolClient for GpioChannel {
     async fn connect(&mut self) -> Result<()> {
         let start = Instant::now();
-        // In a real implementation, validate GPIO chips and pins exist
+
+        // Initialize all output pins at startup (export + set direction to out)
+        let output_pins: Vec<_> = self.config.output_pins().cloned().collect();
+        for pin in &output_pins {
+            if let Err(e) = self.driver.init_output_pin(pin).await {
+                tracing::warn!(
+                    point_id = pin.point_id,
+                    gpio_number = ?pin.gpio_number,
+                    error = %e,
+                    "Failed to initialize GPIO output pin (will retry on first write)"
+                );
+            }
+        }
+
         self.set_state(ConnectionState::Connected);
         self.log_ctx
             .log_connected("gpio", start.elapsed().as_millis() as u64)
             .await;
+
+        tracing::info!(
+            driver = self.driver.name(),
+            output_pins = output_pins.len(),
+            input_pins = self.config.input_pins().count(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "GPIO channel connected"
+        );
+
         Ok(())
     }
 
