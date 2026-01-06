@@ -182,8 +182,10 @@ impl VirtualChannel {
             self.data_buffer.insert(point.id, point.clone());
         }
 
-        // Emit event to all subscribers (broadcast is sync, not async)
-        let _ = self.event_tx.send(DataEvent::DataUpdate(batch.clone()));
+        // Emit event to all subscribers - use Arc to avoid clone overhead on broadcast
+        let _ = self
+            .event_tx
+            .send(DataEvent::DataUpdate(Arc::new(batch.clone())));
 
         // Update diagnostics
         {

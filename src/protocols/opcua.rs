@@ -260,7 +260,13 @@ pub struct OpcUaChannelConfig {
     pub points: Vec<PointConfig>,
 
     /// NodeID to point_id mapping (built from points).
-    node_id_mapping: HashMap<String, u32>,
+    /// Split by identifier type for O(1) lookup without format! allocation.
+    /// Numeric identifiers (i=123) are most common and get fastest lookup.
+    numeric_mapping: HashMap<(u16, u32), u32>,
+    /// String identifiers (s=Temperature)
+    string_mapping: HashMap<(u16, String), u32>,
+    /// Fallback for guid/bytestring identifiers (rarely used)
+    other_mapping: HashMap<String, u32>,
 }
 
 impl OpcUaChannelConfig {
@@ -282,7 +288,9 @@ impl OpcUaChannelConfig {
             session_retry_limit: 3,
             pki_dir: None,
             points: Vec::new(),
-            node_id_mapping: HashMap::new(),
+            numeric_mapping: HashMap::new(),
+            string_mapping: HashMap::new(),
+            other_mapping: HashMap::new(),
         }
     }
 
@@ -372,41 +380,78 @@ impl OpcUaChannelConfig {
 
     /// Add point configurations.
     pub fn with_points(mut self, points: Vec<PointConfig>) -> Self {
-        // Build NodeID mapping from point configs
+        // Build NodeID mapping from point configs - split by identifier type
         for point in &points {
             if let ProtocolAddress::OpcUa(addr) = &point.address {
-                let key = make_node_id_key(addr.namespace_index, &addr.node_id);
-                self.node_id_mapping.insert(key, point.id);
+                let ns = addr.namespace_index;
+                let node_id = &addr.node_id;
+
+                // Parse identifier type and store in appropriate map
+                if let Some(num_str) = node_id.strip_prefix("i=") {
+                    // Numeric identifier (most common)
+                    if let Ok(num) = num_str.parse::<u32>() {
+                        self.numeric_mapping.insert((ns, num), point.id);
+                    }
+                } else if let Some(s) = node_id.strip_prefix("s=") {
+                    // String identifier
+                    self.string_mapping.insert((ns, s.to_string()), point.id);
+                } else {
+                    // Guid or ByteString - use full key format
+                    let key = make_node_id_key(ns, node_id);
+                    self.other_mapping.insert(key, point.id);
+                }
             }
         }
         self.points = points;
         self
     }
 
-    /// Find point_id by NodeID.
+    /// Find point_id by NodeID string.
     pub fn find_point_id(&self, namespace_index: u16, identifier: &str) -> Option<u32> {
+        // Parse identifier type and lookup in appropriate map
+        if let Some(num_str) = identifier.strip_prefix("i=") {
+            if let Ok(num) = num_str.parse::<u32>() {
+                return self.numeric_mapping.get(&(namespace_index, num)).copied();
+            }
+        } else if let Some(s) = identifier.strip_prefix("s=") {
+            return self
+                .string_mapping
+                .get(&(namespace_index, s.to_string()))
+                .copied();
+        }
+        // Fallback to other_mapping for guid/bytestring
         let key = make_node_id_key(namespace_index, identifier);
-        self.node_id_mapping.get(&key).copied()
+        self.other_mapping.get(&key).copied()
     }
 
-    /// Find point_id by NodeId directly (optimized: single format! call).
+    /// Find point_id by NodeId directly (O(1) lookup without allocation for numeric IDs).
     ///
-    /// This avoids the double allocation in handle_data_change where we first
-    /// format the identifier, then call find_point_id which formats again.
+    /// This is the hot-path function called on every data change notification.
+    /// Numeric identifiers (most common) use direct HashMap lookup without format!.
     pub fn find_point_id_by_node_id(&self, node_id: &NodeId) -> Option<u32> {
-        let key = match &node_id.identifier {
-            Identifier::Numeric(n) => format!("ns={};i={}", node_id.namespace, n),
-            Identifier::String(s) => format!("ns={};s={}", node_id.namespace, s.as_ref()),
-            Identifier::Guid(g) => format!("ns={};g={}", node_id.namespace, g),
-            Identifier::ByteString(b) => {
-                format!(
-                    "ns={};b={:?}",
-                    node_id.namespace,
-                    b.value.as_deref().unwrap_or(&[])
-                )
+        let ns = node_id.namespace;
+        match &node_id.identifier {
+            Identifier::Numeric(n) => {
+                // Most common case: O(1) lookup, no allocation
+                self.numeric_mapping.get(&(ns, *n)).copied()
             }
-        };
-        self.node_id_mapping.get(&key).copied()
+            Identifier::String(s) => {
+                // String lookup - need to convert UAString to String for HashMap key
+                self.string_mapping
+                    .get(&(ns, s.as_ref().to_string()))
+                    .copied()
+            }
+            Identifier::Guid(g) => {
+                // Rare: fallback to formatted key
+                let key = format!("ns={};g={}", ns, g);
+                self.other_mapping.get(&key).copied()
+            }
+            Identifier::ByteString(b) => {
+                // Rare: fallback to formatted key
+                let key = format!("ns={};b={:?}", ns, b.value.as_deref().unwrap_or(&[]));
+                self.other_mapping.get(&key).copied()
+            }
+        }
     }
 }
 
@@ -675,20 +720,15 @@ impl OpcUaChannel {
             .subscription_id
             .ok_or_else(|| GatewayError::Protocol("No active subscription".into()))?;
 
-        // Build monitored item requests
-        let items_to_create: Vec<MonitoredItemCreateRequest> = self
-            .config
-            .points
-            .iter()
-            .filter_map(|point| {
-                if let ProtocolAddress::OpcUa(addr) = &point.address {
-                    let node_id = parse_node_id(&addr.node_id, addr.namespace_index);
-                    Some(node_id.into())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Build monitored item requests with pre-allocated capacity
+        let mut items_to_create: Vec<MonitoredItemCreateRequest> =
+            Vec::with_capacity(self.config.points.len());
+        for point in &self.config.points {
+            if let ProtocolAddress::OpcUa(addr) = &point.address {
+                let node_id = parse_node_id(&addr.node_id, addr.namespace_index);
+                items_to_create.push(node_id.into());
+            }
+        }
 
         if items_to_create.is_empty() {
             return Ok(0);
@@ -714,11 +754,11 @@ impl OpcUaChannel {
     }
 
     /// Write node values.
-    async fn write_nodes(&self, write_values: Vec<WriteValue>) -> Result<Vec<StatusCode>> {
+    async fn write_nodes(&self, write_values: &[WriteValue]) -> Result<Vec<StatusCode>> {
         let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         session
-            .write(&write_values)
+            .write(write_values)
             .await
             .map_err(|e| GatewayError::Protocol(format!("Write failed: {}", e)))
     }
@@ -864,7 +904,7 @@ impl ProtocolClient for OpcUaChannel {
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         let mut success_count = 0;
-        let mut failures = Vec::new();
+        let mut failures = Vec::with_capacity(commands.len());
 
         for cmd in commands {
             // Find point config
@@ -897,8 +937,8 @@ impl ProtocolClient for OpcUaChannel {
                 value: DataValue::new_now(Variant::Boolean(value)),
             };
 
-            // Execute write
-            match self.write_nodes(vec![write_value]).await {
+            // Execute write - use slice::from_ref to avoid vec! heap allocation
+            match self.write_nodes(std::slice::from_ref(&write_value)).await {
                 Ok(results) => {
                     if results.first().map(|s| s.is_good()).unwrap_or(false) {
                         success_count += 1;
@@ -965,8 +1005,8 @@ impl ProtocolClient for OpcUaChannel {
                 value: DataValue::new_now(Variant::Double(raw_value)),
             };
 
-            // Execute write
-            match self.write_nodes(vec![write_value]).await {
+            // Execute write - use slice::from_ref to avoid vec! heap allocation
+            match self.write_nodes(std::slice::from_ref(&write_value)).await {
                 Ok(results) => {
                     if results.first().map(|s| s.is_good()).unwrap_or(false) {
                         success_count += 1;
@@ -1103,7 +1143,8 @@ async fn handle_data_change(
     }
 
     // Send event (service layer handles storage)
-    let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
+    // Arc wrap for O(1) broadcast clone, original batch goes to handler
+    let _ = event_tx.send(DataEvent::DataUpdate(Arc::new(batch.clone())));
 
     // Call event handler
     if let Some(handler) = event_handler {

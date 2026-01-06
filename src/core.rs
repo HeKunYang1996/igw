@@ -8,6 +8,7 @@ pub mod logging;
 pub mod metadata;
 pub mod point;
 pub mod quality;
+pub mod slot;
 pub mod traits;
 
 pub use data::*;
@@ -18,4 +19,5 @@ pub use metadata::{
 };
 pub use point::*;
 pub use quality::*;
+pub use slot::{AtomicBoolStore, DataSlot, ShardedSlotStore, SlotStore};
 pub use traits::*;

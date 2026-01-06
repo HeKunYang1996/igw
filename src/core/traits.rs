@@ -519,10 +519,13 @@ pub trait ProtocolServer: Protocol {
 }
 
 /// Data event for event-driven protocols.
+///
+/// Note: `DataUpdate` uses `Arc<DataBatch>` to avoid deep cloning on broadcast.
+/// This is a significant performance optimization for high-frequency data streams.
 #[derive(Debug, Clone)]
 pub enum DataEvent {
-    /// Data update received.
-    DataUpdate(DataBatch),
+    /// Data update received (Arc-wrapped to avoid clone overhead).
+    DataUpdate(Arc<DataBatch>),
 
     /// Connection state changed.
     ConnectionChanged(ConnectionState),

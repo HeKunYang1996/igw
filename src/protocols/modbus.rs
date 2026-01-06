@@ -47,8 +47,9 @@ use crate::core::traits::{
 };
 use crate::protocols::command_batcher::{BatchCommand, CommandBatcher};
 
-// Type alias for grouped points: (slave_id, function_code) -> Vec<PointConfig>
-type GroupedPoints = HashMap<(u8, u8), Vec<PointConfig>>;
+// Type alias for grouped points: (slave_id, function_code) -> Arc<Vec<PointConfig>>
+// Arc wrapping enables O(1) clone when releasing lock for async I/O
+type GroupedPoints = HashMap<(u8, u8), Arc<Vec<PointConfig>>>;
 
 // ============================================================================
 // Strongly-typed mapping configs for JSON deserialization
@@ -770,16 +771,37 @@ impl ModbusChannel {
     ///
     /// All configured points are included. The application layer determines
     /// which points should be polled based on their SCADA type.
+    ///
+    /// Points within each group are pre-sorted by register address to avoid
+    /// repeated sorting during each poll cycle.
     async fn group_points_for_polling(&self) {
-        let mut groups: GroupedPoints = HashMap::new();
+        // First build temporary groups without Arc
+        let mut temp_groups: HashMap<(u8, u8), Vec<PointConfig>> = HashMap::new();
 
         for point in &self.config.points {
             // Extract Modbus address
             if let ProtocolAddress::Modbus(addr) = &point.address {
                 let key = (addr.slave_id, addr.function_code);
-                groups.entry(key).or_default().push(point.clone());
+                temp_groups.entry(key).or_default().push(point.clone());
             }
         }
+
+        // Pre-sort each group by register address (avoids sorting on every poll)
+        for points in temp_groups.values_mut() {
+            points.sort_by_key(|p| {
+                if let ProtocolAddress::Modbus(addr) = &p.address {
+                    addr.register
+                } else {
+                    u16::MAX // Non-Modbus addresses go to end (shouldn't happen)
+                }
+            });
+        }
+
+        // Wrap each group in Arc for O(1) clone during polling
+        let groups: GroupedPoints = temp_groups
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect();
 
         let mut guard = self.grouped_points.write().await;
         *guard = groups;
@@ -876,8 +898,9 @@ impl ModbusChannel {
         max_batch_size: u16,
         max_gap: u16,
     ) -> Vec<(u32, DataPoint)> {
-        // Sort points by register address
-        let mut sorted_points: Vec<_> = points
+        // Points are pre-sorted by register address in group_points_for_polling()
+        // Just extract register info without re-sorting
+        let sorted_points: Vec<_> = points
             .iter()
             .filter_map(|p| {
                 if let ProtocolAddress::Modbus(addr) = &p.address {
@@ -887,7 +910,6 @@ impl ModbusChannel {
                 }
             })
             .collect();
-        sorted_points.sort_by_key(|(addr, _, _)| *addr);
 
         if sorted_points.is_empty() {
             return Vec::new();
@@ -1419,13 +1441,14 @@ impl ProtocolClient for ModbusChannel {
             .log_state_changed(old_state, ConnectionState::Connecting)
             .await;
 
-        // Get endpoint for logging
-        let endpoint = match self.config.connection_mode {
-            ConnectionMode::Tcp => self.config.address.clone(),
+        // Get endpoint for logging - use Cow to avoid clone for TCP
+        let endpoint: std::borrow::Cow<'_, str> = match self.config.connection_mode {
+            ConnectionMode::Tcp => std::borrow::Cow::Borrowed(&self.config.address),
             #[cfg(feature = "modbus")]
-            ConnectionMode::Rtu => {
-                format!("{}@{}", self.config.rtu_device, self.config.baud_rate)
-            }
+            ConnectionMode::Rtu => std::borrow::Cow::Owned(format!(
+                "{}@{}",
+                self.config.rtu_device, self.config.baud_rate
+            )),
         };
 
         // Create client based on connection mode
@@ -1460,8 +1483,10 @@ impl ProtocolClient for ModbusChannel {
                 *client_guard = Some(wrapper);
                 self.set_state(ConnectionState::Connected);
 
-                // Log successful connection
-                self.log_context.log_connected(&endpoint, duration_ms).await;
+                // Log successful connection - deref Cow to &str
+                self.log_context
+                    .log_connected(&*endpoint, duration_ms)
+                    .await;
                 self.log_context
                     .log_state_changed(ConnectionState::Connecting, ConnectionState::Connected)
                     .await;
@@ -1556,7 +1581,7 @@ impl ProtocolClient for ModbusChannel {
             if results.is_empty() && !points.is_empty() {
                 // Read returned no results - record failures for all points in group
                 error_count += 1;
-                for point in points {
+                for point in points.iter() {
                     failures.push(PointFailure::new(point.id, "Read failed - no response"));
                 }
             }
@@ -1603,7 +1628,7 @@ impl ProtocolClient for ModbusChannel {
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         let start_time = std::time::Instant::now();
         let mut success_count = 0;
-        let mut failures: Vec<(u32, String)> = Vec::new();
+        let mut failures: Vec<(u32, String)> = Vec::with_capacity(commands.len());
 
         // Lock client for the entire operation
         let mut client_guard = self.client.lock().await;
@@ -1723,7 +1748,7 @@ impl ProtocolClient for ModbusChannel {
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
         let start_time = std::time::Instant::now();
         let mut success_count = 0;
-        let mut failures: Vec<(u32, String)> = Vec::new();
+        let mut failures: Vec<(u32, String)> = Vec::with_capacity(adjustments.len());
 
         // Lock client for the entire operation
         let mut client_guard = self.client.lock().await;

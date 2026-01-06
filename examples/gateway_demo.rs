@@ -356,9 +356,10 @@ impl Gateway {
                     event = data_rx.recv() => {
                         match event {
                             Ok(DataEvent::DataUpdate(batch)) => {
+                                // batch is Arc<DataBatch>, extract inner for GatewayEvent
                                 let _ = event_tx.send(GatewayEvent::DataUpdate {
                                     channel_id,
-                                    batch,
+                                    batch: (*batch).clone(),
                                 });
                             }
                             Ok(DataEvent::Error(e)) => {

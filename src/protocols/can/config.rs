@@ -30,6 +30,30 @@ impl Default for CanConfig {
     }
 }
 
+/// CAN data type enumeration.
+///
+/// Using an enum instead of String eliminates heap allocation per point
+/// and enables fast integer-based matching in the decoder hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CanDataType {
+    /// Unsigned 8-bit integer
+    UInt8,
+    /// Unsigned 16-bit integer (default)
+    #[default]
+    UInt16,
+    /// Signed 16-bit integer
+    Int16,
+    /// Unsigned 32-bit integer
+    UInt32,
+    /// Signed 32-bit integer
+    Int32,
+    /// 32-bit floating point
+    Float32,
+    /// ASCII string
+    Ascii,
+}
+
 /// CAN point mapping structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanPoint {
@@ -43,8 +67,8 @@ pub struct CanPoint {
     pub bit_position: u8,
     /// Bit length (2/8/16/32/64)
     pub bit_length: u8,
-    /// Data type (uint8, uint16, int16, uint32, int32, ascii)
-    pub data_type: String,
+    /// Data type for interpretation
+    pub data_type: CanDataType,
     /// Scale factor for linear transformation (value = raw * scale + offset)
     #[serde(default = "default_scale")]
     pub scale: f64,
@@ -100,17 +124,13 @@ pub struct CanMappingConfig {
     #[serde(default = "default_bit_length")]
     pub bit_length: u8,
 
-    /// Data type string (uint8, uint16, int16, uint32, int32, float32, ascii).
-    #[serde(default = "default_data_type")]
-    pub data_type: String,
+    /// Data type for interpretation.
+    #[serde(default)]
+    pub data_type: CanDataType,
 }
 
 fn default_bit_length() -> u8 {
     16
-}
-
-fn default_data_type() -> String {
-    "uint16".to_string()
 }
 
 impl CanMappingConfig {
@@ -122,7 +142,7 @@ impl CanMappingConfig {
             byte_offset: self.byte_offset,
             bit_position: self.bit_position,
             bit_length: self.bit_length,
-            data_type: self.data_type.clone(),
+            data_type: self.data_type, // Copy, no clone needed
             scale,
             offset,
         }

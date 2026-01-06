@@ -387,7 +387,8 @@ impl Iec104Channel {
                 let batch = self.convert_data_points(points).await;
                 if !batch.is_empty() {
                     // Send event (service layer handles storage)
-                    let _ = self.event_tx.send(DataEvent::DataUpdate(batch));
+                    // Arc wrap for O(1) broadcast clone
+                    let _ = self.event_tx.send(DataEvent::DataUpdate(Arc::new(batch)));
 
                     // Update diagnostics
                     let mut diag = self.diagnostics.write().await;

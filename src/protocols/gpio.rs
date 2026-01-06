@@ -70,6 +70,7 @@ use crate::core::logging::{
     ChannelLogConfig, ChannelLogHandler, ErrorContext, LogContext, LoggableProtocol,
 };
 use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
+use crate::core::slot::AtomicBoolStore;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
     PointFailure, PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
@@ -943,8 +944,8 @@ pub struct GpioChannel {
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<GpioDiagnostics>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
-    /// Output states cache (for read-back)
-    output_states: Arc<RwLock<std::collections::HashMap<u32, bool>>>,
+    /// Output states cache (for read-back) - lock-free atomic storage
+    output_states: AtomicBoolStore,
     /// Logging context
     log_ctx: LogContext,
 }
@@ -955,6 +956,9 @@ impl GpioChannel {
     /// GPIO channels are always "connected" since they operate on local hardware
     /// without requiring external network connections (unlike Modbus TCP).
     pub fn new(config: GpioChannelConfig) -> Self {
+        // Collect output pin IDs for lock-free AtomicBoolStore
+        let output_pin_ids: Vec<u32> = config.output_pins().map(|p| p.point_id).collect();
+
         // Create driver based on configuration
         let driver: Box<dyn GpioDriver> = match &config.driver {
             GpioDriverType::Gpiod => Box::new(GpiodDriver::new()),
@@ -967,7 +971,7 @@ impl GpioChannel {
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Connected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
-            output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            output_states: AtomicBoolStore::from_pins(&output_pin_ids),
             log_ctx: LogContext::new(0), // channel_id set later
         }
     }
@@ -977,6 +981,9 @@ impl GpioChannel {
     /// This allows using custom driver implementations beyond the built-in ones.
     /// GPIO channels are always "connected" since they operate on local hardware.
     pub fn with_driver(config: GpioChannelConfig, driver: Box<dyn GpioDriver>) -> Self {
+        // Collect output pin IDs for lock-free AtomicBoolStore
+        let output_pin_ids: Vec<u32> = config.output_pins().map(|p| p.point_id).collect();
+
         Self {
             config,
             driver,
@@ -984,7 +991,7 @@ impl GpioChannel {
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Connected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
-            output_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            output_states: AtomicBoolStore::from_pins(&output_pin_ids),
             log_ctx: LogContext::new(0),
         }
     }
@@ -1033,18 +1040,16 @@ impl GpioChannel {
         let adjusted = if pin_config.active_low { !value } else { value };
         self.driver.write_pin(pin_config, adjusted).await?;
 
-        // Update internal state cache for feedback
-        self.output_states
-            .write()
-            .await
-            .insert(pin_config.point_id, adjusted);
+        // Update internal state cache for feedback (lock-free atomic operation)
+        self.output_states.set(pin_config.point_id, adjusted);
 
         Ok(())
     }
 
     /// Read output state (for feedback).
-    async fn read_output_state(&self, point_id: u32) -> Option<bool> {
-        self.output_states.read().await.get(&point_id).copied()
+    fn read_output_state(&self, point_id: u32) -> Option<bool> {
+        // Lock-free atomic read
+        self.output_states.get(point_id)
     }
 }
 
@@ -1094,9 +1099,9 @@ impl GpioChannel {
             }
         }
 
-        // Also include output states as feedback
+        // Also include output states as feedback (lock-free read)
         for pin in self.config.output_pins() {
-            if let Some(state) = self.read_output_state(pin.point_id).await {
+            if let Some(state) = self.read_output_state(pin.point_id) {
                 batch.add(DataPoint::new(pin.point_id, state));
             }
         }
@@ -1314,8 +1319,8 @@ mod tests {
         assert_eq!(result.success_count, 1);
         assert!(result.failures.is_empty());
 
-        // Check output state
-        let state = gpio.read_output_state(101).await;
+        // Check output state (lock-free read)
+        let state = gpio.read_output_state(101);
         assert_eq!(state, Some(true));
     }
 

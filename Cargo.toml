@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.2.17"
+version = "0.2.18"
 edition = "2021"
 rust-version = "1.85"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"

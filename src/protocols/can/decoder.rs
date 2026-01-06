@@ -5,7 +5,7 @@
 
 use crate::core::data::Value;
 use crate::core::error::{GatewayError, Result};
-use crate::protocols::can::config::CanPoint;
+use crate::protocols::can::config::{CanDataType, CanPoint};
 
 use std::collections::HashMap;
 
@@ -26,6 +26,11 @@ impl PointManager {
     /// Add a point to the manager
     pub fn add_point(&mut self, point: CanPoint) {
         self.points.insert(point.point_id, point);
+    }
+
+    /// Get all point IDs for SlotStore initialization.
+    pub fn point_ids(&self) -> Vec<u32> {
+        self.points.keys().copied().collect()
     }
 
     /// Apply mappings to decode CAN frames into data points
@@ -191,15 +196,15 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
     )?;
     let raw_bytes = field.as_slice();
 
-    // Decode based on data type
-    let raw_value = match point.data_type.as_str() {
-        "uint8" => {
+    // Decode based on data type (enum matching - faster than string comparison)
+    let raw_value = match point.data_type {
+        CanDataType::UInt8 => {
             if raw_bytes.is_empty() {
                 return Err(GatewayError::Protocol("Empty data for uint8".to_string()));
             }
             Value::Integer(raw_bytes[0] as i64)
         }
-        "uint16" => {
+        CanDataType::UInt16 => {
             if raw_bytes.len() < 2 {
                 return Err(GatewayError::Protocol(format!(
                     "Not enough bytes for uint16, got {}",
@@ -209,7 +214,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
             let raw = u16::from_le_bytes([raw_bytes[0], raw_bytes[1]]);
             Value::Integer(raw as i64)
         }
-        "int16" => {
+        CanDataType::Int16 => {
             if raw_bytes.len() < 2 {
                 return Err(GatewayError::Protocol(format!(
                     "Not enough bytes for int16, got {}",
@@ -219,7 +224,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
             let raw = i16::from_le_bytes([raw_bytes[0], raw_bytes[1]]);
             Value::Integer(raw as i64)
         }
-        "uint32" => {
+        CanDataType::UInt32 => {
             if raw_bytes.len() < 4 {
                 return Err(GatewayError::Protocol(format!(
                     "Not enough bytes for uint32, got {}",
@@ -229,7 +234,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
             let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
             Value::Integer(raw as i64)
         }
-        "int32" => {
+        CanDataType::Int32 => {
             if raw_bytes.len() < 4 {
                 return Err(GatewayError::Protocol(format!(
                     "Not enough bytes for int32, got {}",
@@ -239,15 +244,17 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
             let raw = i32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
             Value::Integer(raw as i64)
         }
-        "int" => {
-            // Generic "int" type - infer size from bit_length
-            // For 2-bit signal values (common for alarms), treat as uint8
-            if raw_bytes.is_empty() {
-                return Err(GatewayError::Protocol("Empty data for int".to_string()));
+        CanDataType::Float32 => {
+            if raw_bytes.len() < 4 {
+                return Err(GatewayError::Protocol(format!(
+                    "Not enough bytes for float32, got {}",
+                    raw_bytes.len()
+                )));
             }
-            Value::Integer(raw_bytes[0] as i64)
+            let raw = f32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
+            Value::Float(raw as f64)
         }
-        "ascii" => {
+        CanDataType::Ascii => {
             // Decode ASCII string, stopping at first null byte
             // Use into_owned() + in-place truncation to avoid double allocation
             let mut s = String::from_utf8_lossy(raw_bytes).into_owned();
@@ -255,12 +262,6 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
                 s.pop();
             }
             Value::String(s)
-        }
-        _ => {
-            return Err(GatewayError::Protocol(format!(
-                "Unsupported data type: {}",
-                point.data_type
-            )));
         }
     };
 

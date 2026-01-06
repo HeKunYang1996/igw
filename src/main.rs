@@ -73,9 +73,9 @@ fn list_protocols() {
 }
 
 fn generate_example(protocol: &str) {
-    let example = match protocol.to_lowercase().as_str() {
-        "modbus" => {
-            r#"# IGW Configuration - Modbus Example
+    // Use eq_ignore_ascii_case to avoid String allocation from to_lowercase()
+    let example = if protocol.eq_ignore_ascii_case("modbus") {
+        r#"# IGW Configuration - Modbus Example
 
 [gateway]
 name = "Modbus Gateway"
@@ -111,9 +111,8 @@ address = "1:101"
 scale = 0.01
 offset = 0.0
 "#
-        }
-        "iec104" => {
-            r#"# IGW Configuration - IEC 104 Example
+    } else if protocol.eq_ignore_ascii_case("iec104") {
+        r#"# IGW Configuration - IEC 104 Example
 
 [gateway]
 name = "IEC104 Gateway"
@@ -141,9 +140,8 @@ id = 2002
 name = "Current_A"
 address = "1002"
 "#
-        }
-        "virtual" => {
-            r#"# IGW Configuration - Virtual Channel Example
+    } else if protocol.eq_ignore_ascii_case("virtual") {
+        r#"# IGW Configuration - Virtual Channel Example
 
 [gateway]
 name = "Virtual Gateway"
@@ -170,12 +168,10 @@ id = 1002
 name = "SimulatedPressure"
 address = "pressure"
 "#
-        }
-        _ => {
-            eprintln!("Unknown protocol: {}", protocol);
-            eprintln!("Available: modbus, iec104, virtual");
-            return;
-        }
+    } else {
+        eprintln!("Unknown protocol: {}", protocol);
+        eprintln!("Available: modbus, iec104, virtual");
+        return;
     };
 
     println!("{}", example);

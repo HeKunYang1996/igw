@@ -2,7 +2,6 @@
 //!
 //! Implements the igw Protocol traits for LYNK CAN communication.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -13,6 +12,8 @@ use tokio::task::JoinHandle;
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
+use crate::core::quality::Quality;
+use crate::core::slot::SlotStore;
 
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
@@ -57,8 +58,8 @@ pub struct CanClient {
     // Point manager
     point_manager: Arc<PointManager>,
 
-    // Cached data (latest values)
-    cached_data: Arc<RwLock<HashMap<u32, DataPoint>>>,
+    // Slot store for cached data (Vec+Index, lock-free reads)
+    slot_store: Arc<SlotStore>,
 }
 
 impl CanClient {
@@ -81,7 +82,8 @@ impl CanClient {
             event_handler: None,
             frame_cache: Arc::new(RwLock::new(CanFrameCache::new())),
             point_manager: Arc::new(point_manager),
-            cached_data: Arc::new(RwLock::new(HashMap::new())),
+            // Start with empty SlotStore, will be rebuilt in start_events()
+            slot_store: Arc::new(SlotStore::empty()),
         }
     }
 
@@ -258,10 +260,14 @@ impl CanClient {
 
     /// Start the data reading task.
     fn start_read_task(&mut self) -> Result<()> {
+        // Build SlotStore with actual point IDs now that all points are known
+        let point_ids = self.point_manager.point_ids();
+        self.slot_store = Arc::new(SlotStore::from_points(&point_ids));
+
         let is_connected = Arc::clone(&self.is_connected);
         let frame_cache = Arc::clone(&self.frame_cache);
         let point_manager = Arc::clone(&self.point_manager);
-        let cached_data = Arc::clone(&self.cached_data);
+        let slot_store = Arc::clone(&self.slot_store);
         let read_count = Arc::clone(&self.read_count);
         let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
@@ -305,20 +311,19 @@ impl CanClient {
                             continue;
                         }
 
-                        // Pre-allocate batch and update cache in single pass
+                        // Pre-allocate batch and update slot store (lock-free)
                         let mut batch = DataBatch::with_capacity(decoded_points.len());
 
-                        // Single lock acquisition for all operations
-                        {
-                            let mut cache = cached_data.write().await;
-                            for (point_id, value) in decoded_points {
-                                #[cfg(feature = "tracing-support")]
-                                tracing::debug!("  Point {}: {:?}", point_id, value);
+                        for (point_id, value) in decoded_points {
+                            #[cfg(feature = "tracing-support")]
+                            tracing::debug!("  Point {}: {:?}", point_id, value);
 
-                                let data_point = DataPoint::new(point_id, value);
-                                batch.add(data_point.clone()); // Clone for batch
-                                cache.insert(point_id, data_point); // Move to cache
-                            }
+                            // Update slot store (lock-free atomic operation)
+                            slot_store.update(point_id, value.clone(), Quality::Good);
+
+                            // Add to batch for event dispatch
+                            let data_point = DataPoint::new(point_id, value);
+                            batch.add(data_point);
                         }
 
                         if !batch.is_empty() {
@@ -331,9 +336,10 @@ impl CanClient {
                             );
 
                             // Send event (broadcast is sync, not async)
+                            // Arc wrap for O(1) broadcast clone
                             #[cfg(feature = "tracing-support")]
                             tracing::debug!("Sending DataUpdate event via event_tx");
-                            let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
+                            let _ = event_tx.send(DataEvent::DataUpdate(Arc::new(batch.clone())));
 
                             // Call handler
                             if let Some(ref handler) = event_handler {
@@ -462,12 +468,8 @@ impl ProtocolClient for CanClient {
     }
 
     async fn poll_once(&mut self) -> PollResult {
-        // CAN protocol is event-driven, return current cached data
-        let cached = self.cached_data.read().await;
-        let mut batch = DataBatch::new();
-        for point in cached.values() {
-            batch.add(point.clone());
-        }
+        // CAN protocol is event-driven, export all cached data from slot store
+        let batch = self.slot_store.export_all();
         PollResult::success(batch)
     }
 

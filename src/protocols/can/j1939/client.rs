@@ -2,17 +2,18 @@
 //!
 //! Implements the igw Protocol traits for J1939/CAN communication.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
-use voltage_j1939::{database_stats, decode_frame, extract_source_address};
+use voltage_j1939::{build_spn_database, database_stats, decode_frame, extract_source_address};
 
 use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::{GatewayError, Result};
+use crate::core::quality::Quality;
+use crate::core::slot::SlotStore;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
@@ -77,8 +78,8 @@ pub struct J1939Client {
     event_tx: DataEventSender,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 
-    // Cached data (latest values) - keyed by SPN (u32) for efficiency
-    cached_data: Arc<RwLock<HashMap<u32, DataPoint>>>,
+    // Slot store for cached data - pre-built from J1939 SPN database
+    slot_store: Arc<SlotStore>,
 }
 
 impl J1939Client {
@@ -86,6 +87,11 @@ impl J1939Client {
     pub fn new(config: J1939Config) -> Self {
         // Use broadcast channel for multiple subscribers
         let (event_tx, _) = broadcast::channel(1024);
+
+        // Build SlotStore from J1939 SPN database - all known SPNs pre-indexed
+        let spn_db = build_spn_database();
+        let spn_ids: Vec<u32> = spn_db.keys().copied().collect();
+        let slot_store = Arc::new(SlotStore::from_points(&spn_ids));
 
         Self {
             config,
@@ -97,7 +103,7 @@ impl J1939Client {
             receive_handle: None,
             event_tx,
             event_handler: None,
-            cached_data: Arc::new(RwLock::new(HashMap::new())),
+            slot_store,
         }
     }
 
@@ -106,7 +112,7 @@ impl J1939Client {
         let can_interface = self.config.can_interface.clone();
         let source_address = self.config.source_address;
         let is_connected = Arc::clone(&self.is_connected);
-        let cached_data = Arc::clone(&self.cached_data);
+        let slot_store = Arc::clone(&self.slot_store);
         let read_count = Arc::clone(&self.read_count);
         let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
@@ -145,24 +151,27 @@ impl J1939Client {
                                 continue;
                             }
 
-                            // Pre-allocate batch and update cache in single pass
+                            // Pre-allocate batch and update slot store (lock-free)
                             let mut batch = DataBatch::with_capacity(decoded_spns.len());
 
-                            // Single lock acquisition for all operations
-                            {
-                                let mut cache = cached_data.write().await;
-                                for d in decoded_spns {
-                                    let data_point = DataPoint::new(d.spn, Value::Float(d.value));
-                                    batch.add(data_point.clone()); // Clone for batch
-                                    cache.insert(d.spn, data_point); // Move to cache
-                                }
+                            for d in decoded_spns {
+                                let value = Value::Float(d.value);
+
+                                // Update slot store (lock-free atomic operation)
+                                slot_store.update(d.spn, value.clone(), Quality::Good);
+
+                                // Add to batch for event dispatch
+                                let data_point = DataPoint::new(d.spn, value);
+                                batch.add(data_point);
                             }
 
                             if !batch.is_empty() {
                                 read_count.fetch_add(1, Ordering::Relaxed);
 
                                 // Send event (broadcast is sync)
-                                let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
+                                // Arc wrap for O(1) broadcast clone
+                                let _ =
+                                    event_tx.send(DataEvent::DataUpdate(Arc::new(batch.clone())));
 
                                 // Call handler
                                 if let Some(ref handler) = event_handler {
@@ -297,12 +306,8 @@ impl ProtocolClient for J1939Client {
     }
 
     async fn poll_once(&mut self) -> PollResult {
-        // J1939 is event-driven, but poll_once returns cached data
-        let cached = self.cached_data.read().await;
-        let mut batch = DataBatch::new();
-        for point in cached.values() {
-            batch.add(point.clone());
-        }
+        // J1939 is event-driven, export all cached data from slot store
+        let batch = self.slot_store.export_all();
         PollResult::success(batch)
     }
 
