@@ -1086,7 +1086,7 @@ impl GpioChannel {
             match self.read_pin(pin).await {
                 Ok(point) => batch.add(point),
                 Err(e) => {
-                    failures.push(PointFailure::new(pin.point_id, e.to_string()));
+                    failures.push(PointFailure::with_error(pin.point_id, e.to_string()));
                     let mut diag = self.diagnostics.write().await;
                     diag.error_count += 1;
                     diag.last_error = Some(e.to_string());
@@ -1140,8 +1140,9 @@ impl ProtocolClient for GpioChannel {
         let start = Instant::now();
 
         // Initialize all output pins at startup (export + set direction to out)
-        let output_pins: Vec<_> = self.config.output_pins().cloned().collect();
-        for pin in &output_pins {
+        let mut output_count = 0usize;
+        for pin in self.config.output_pins() {
+            output_count += 1;
             if let Err(e) = self.driver.init_output_pin(pin).await {
                 tracing::warn!(
                     point_id = pin.point_id,
@@ -1159,7 +1160,7 @@ impl ProtocolClient for GpioChannel {
 
         tracing::info!(
             driver = self.driver.name(),
-            output_pins = output_pins.len(),
+            output_pins = output_count,
             input_pins = self.config.input_pins().count(),
             elapsed_ms = start.elapsed().as_millis(),
             "GPIO channel connected"
@@ -1194,10 +1195,10 @@ impl ProtocolClient for GpioChannel {
                 .await;
         }
 
-        // Log poll cycle with actual error count
+        // Log poll cycle (pass count instead of cloning batch)
         self.log_ctx
             .log_poll_cycle(
-                batch.clone(),
+                batch.len(),
                 start.elapsed().as_millis() as u64,
                 batch.len(),
                 failures.len(),
@@ -1253,7 +1254,7 @@ impl ProtocolClient for GpioChannel {
         // Log control write
         self.log_ctx
             .log_control_write(
-                commands.to_vec(),
+                commands,
                 Ok(result.clone()),
                 start.elapsed().as_millis() as u64,
             )

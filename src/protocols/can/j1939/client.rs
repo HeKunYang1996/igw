@@ -77,8 +77,8 @@ pub struct J1939Client {
     event_tx: DataEventSender,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 
-    // Cached data (latest values)
-    cached_data: Arc<RwLock<HashMap<String, DataPoint>>>,
+    // Cached data (latest values) - keyed by SPN (u32) for efficiency
+    cached_data: Arc<RwLock<HashMap<u32, DataPoint>>>,
 }
 
 impl J1939Client {
@@ -145,20 +145,17 @@ impl J1939Client {
                                 continue;
                             }
 
-                            let mut batch = DataBatch::new();
+                            // Pre-allocate batch and update cache in single pass
+                            let mut batch = DataBatch::with_capacity(decoded_spns.len());
 
-                            for decoded in decoded_spns {
-                                // J1939 uses SPN as point ID (converted to u32)
-                                let data_point =
-                                    DataPoint::new(decoded.spn, Value::Float(decoded.value));
-
-                                batch.add(data_point.clone());
-
-                                // Update cache using SPN string as key
-                                cached_data
-                                    .write()
-                                    .await
-                                    .insert(decoded.spn.to_string(), data_point);
+                            // Single lock acquisition for all operations
+                            {
+                                let mut cache = cached_data.write().await;
+                                for d in decoded_spns {
+                                    let data_point = DataPoint::new(d.spn, Value::Float(d.value));
+                                    batch.add(data_point.clone()); // Clone for batch
+                                    cache.insert(d.spn, data_point); // Move to cache
+                                }
                             }
 
                             if !batch.is_empty() {

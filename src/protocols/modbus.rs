@@ -760,10 +760,10 @@ impl ModbusChannel {
     }
 
     /// Record an error in diagnostics.
-    async fn record_error(&self, error: &str) {
+    async fn record_error(&self, error: String) {
         let mut diag = self.diagnostics.write().await;
         diag.error_count += 1;
-        diag.last_error = Some(error.to_string());
+        diag.last_error = Some(error);
     }
 
     /// Pre-group points by (slave_id, function_code) for polling optimization.
@@ -1125,7 +1125,7 @@ impl ModbusChannel {
             .ok_or_else(|| GatewayError::InvalidAddress(format!("Point {} not found", adj.id)))?;
 
         let modbus_addr = match &point.address {
-            ProtocolAddress::Modbus(addr) => addr.clone(),
+            ProtocolAddress::Modbus(addr) => addr, // Borrow instead of clone
             _ => {
                 return Err(GatewayError::InvalidAddress(
                     "Non-Modbus address type".into(),
@@ -1136,7 +1136,7 @@ impl ModbusChannel {
         // Apply reverse transform to get raw value
         let raw_value = reverse_transform(adj.value, &point.transform)?;
 
-        // Create batch command
+        // Create batch command (fields are Copy types, no clone needed)
         let batch_cmd = BatchCommand {
             point_id: adj.id,
             value: Value::Float(raw_value),
@@ -1215,8 +1215,10 @@ impl ModbusChannel {
                     Ok(count) => success_count += count,
                     Err(e) => {
                         // If merged write fails, record for all commands
+                        // Share error string to avoid N allocations
+                        let err_msg = e.to_string();
                         for cmd in &commands {
-                            failures.push((cmd.point_id, e.to_string()));
+                            failures.push((cmd.point_id, err_msg.clone()));
                         }
                     }
                 }
@@ -1288,15 +1290,25 @@ impl ModbusChannel {
         commands: &[BatchCommand],
         failures: &mut Vec<(u32, String)>,
     ) -> std::result::Result<usize, voltage_modbus::ModbusError> {
-        // Sort commands by register address
-        let mut sorted = commands.to_vec();
-        sorted.sort_by_key(|c| c.register_address);
+        // Record initial failures count to calculate only new failures from this function
+        let initial_failures = failures.len();
 
-        // Build merged register buffer
-        let start_addr = sorted[0].register_address;
-        let mut registers = Vec::new();
+        // Sort by index to avoid cloning all commands
+        let mut indices: Vec<usize> = (0..commands.len()).collect();
+        indices.sort_by_key(|&i| commands[i].register_address);
 
-        for cmd in &sorted {
+        // Pre-calculate total register count for allocation
+        let total_regs: usize = commands
+            .iter()
+            .map(|c| c.data_format.register_count() as usize)
+            .sum();
+
+        // Build merged register buffer with pre-allocated capacity
+        let start_addr = commands[indices[0]].register_address;
+        let mut registers = Vec::with_capacity(total_regs);
+
+        for &i in &indices {
+            let cmd = &commands[i];
             let raw_value = cmd.value.as_f64().unwrap_or(0.0);
             match encode_value(raw_value, cmd.data_format, cmd.byte_order) {
                 Ok(regs) => registers.extend(regs),
@@ -1314,15 +1326,16 @@ impl ModbusChannel {
         // Execute merged FC16
         debug!(
             "FC16 merge: {} commands → {} registers starting at {}",
-            sorted.len(),
+            commands.len(),
             registers.len(),
             start_addr
         );
 
         client.write_10(slave_id, start_addr, &registers).await?;
 
-        // Count successful writes (excluding any that failed encoding)
-        Ok(sorted.len() - failures.len())
+        // Count successful writes (only counting failures added in this function)
+        let encode_failures = failures.len() - initial_failures;
+        Ok(commands.len().saturating_sub(encode_failures))
     }
 }
 
@@ -1459,11 +1472,12 @@ impl ProtocolClient for ModbusChannel {
             }
             Err(e) => {
                 self.set_state(ConnectionState::Error);
-                self.record_error(&e.to_string()).await;
+                let err_msg = e.to_string();
+                self.record_error(err_msg.clone()).await;
 
                 // Log error
                 self.log_context
-                    .log_error(&e.to_string(), ErrorContext::Connection)
+                    .log_error(&err_msg, ErrorContext::Connection)
                     .await;
                 self.log_context
                     .log_state_changed(ConnectionState::Connecting, ConnectionState::Error)
@@ -1569,10 +1583,10 @@ impl ProtocolClient for ModbusChannel {
             failures.len()
         );
 
-        // Log poll cycle
+        // Log poll cycle (pass count instead of cloning batch)
         self.log_context
             .log_poll_cycle(
-                batch.clone(),
+                batch.len(),
                 duration_ms,
                 read_count as usize,
                 error_count as usize,
@@ -1588,10 +1602,8 @@ impl ProtocolClient for ModbusChannel {
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         let start_time = std::time::Instant::now();
-        let commands_vec = commands.to_vec();
         let mut success_count = 0;
-        let mut failures = Vec::new();
-        let mut errors_to_record = Vec::new();
+        let mut failures: Vec<(u32, String)> = Vec::new();
 
         // Lock client for the entire operation
         let mut client_guard = self.client.lock().await;
@@ -1601,7 +1613,7 @@ impl ProtocolClient for ModbusChannel {
                 let err = GatewayError::NotConnected;
                 self.log_context
                     .log_control_write(
-                        commands_vec,
+                        commands,
                         Err(err.to_string()),
                         start_time.elapsed().as_millis() as u64,
                     )
@@ -1623,7 +1635,7 @@ impl ProtocolClient for ModbusChannel {
             };
 
             let modbus_addr = match &point.address {
-                ProtocolAddress::Modbus(addr) => addr.clone(),
+                ProtocolAddress::Modbus(addr) => addr, // Borrow instead of clone
                 _ => {
                     failures.push((cmd.id, "Invalid address type".into()));
                     continue;
@@ -1670,9 +1682,8 @@ impl ProtocolClient for ModbusChannel {
                     success_count += 1;
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    failures.push((cmd.id, err_msg.clone()));
-                    errors_to_record.push(err_msg);
+                    // Store error directly in failures, no separate Vec needed
+                    failures.push((cmd.id, e.to_string()));
                 }
             }
         }
@@ -1681,12 +1692,17 @@ impl ProtocolClient for ModbusChannel {
         drop(client_guard);
 
         // Record errors and update diagnostics after loop
+        // Use failures directly instead of separate errors_to_record
         {
             let mut diag = self.diagnostics.write().await;
             diag.write_count += success_count as u64;
-            if let Some(err) = errors_to_record.last() {
-                diag.error_count += errors_to_record.len() as u64;
-                diag.last_error = Some(err.clone());
+            let error_count = failures.len();
+            if error_count > 0 {
+                diag.error_count += error_count as u64;
+                // Use last failure's error message, avoiding extra clone
+                if let Some((_, err)) = failures.last() {
+                    diag.last_error = Some(err.clone());
+                }
             }
         }
 
@@ -1698,7 +1714,7 @@ impl ProtocolClient for ModbusChannel {
 
         // Log control write
         self.log_context
-            .log_control_write(commands_vec, Ok(result.clone()), duration_ms)
+            .log_control_write(commands, Ok(result.clone()), duration_ms)
             .await;
 
         Ok(result)
@@ -1706,10 +1722,8 @@ impl ProtocolClient for ModbusChannel {
 
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
         let start_time = std::time::Instant::now();
-        let adjustments_vec = adjustments.to_vec();
         let mut success_count = 0;
-        let mut failures = Vec::new();
-        let mut errors_to_record = Vec::new();
+        let mut failures: Vec<(u32, String)> = Vec::new();
 
         // Lock client for the entire operation
         let mut client_guard = self.client.lock().await;
@@ -1719,7 +1733,7 @@ impl ProtocolClient for ModbusChannel {
                 let err = GatewayError::NotConnected;
                 self.log_context
                     .log_adjustment_write(
-                        adjustments_vec,
+                        adjustments,
                         Err(err.to_string()),
                         start_time.elapsed().as_millis() as u64,
                     )
@@ -1741,7 +1755,7 @@ impl ProtocolClient for ModbusChannel {
             };
 
             let modbus_addr = match &point.address {
-                ProtocolAddress::Modbus(addr) => addr.clone(),
+                ProtocolAddress::Modbus(addr) => addr, // Borrow instead of clone
                 _ => {
                     failures.push((adj.id, "Invalid address type".into()));
                     continue;
@@ -1782,9 +1796,8 @@ impl ProtocolClient for ModbusChannel {
                     success_count += 1;
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    failures.push((adj.id, err_msg.clone()));
-                    errors_to_record.push(err_msg);
+                    // Store error directly in failures, no separate Vec needed
+                    failures.push((adj.id, e.to_string()));
                 }
             }
         }
@@ -1793,12 +1806,17 @@ impl ProtocolClient for ModbusChannel {
         drop(client_guard);
 
         // Record errors and update diagnostics after loop
+        // Use failures directly instead of separate errors_to_record
         {
             let mut diag = self.diagnostics.write().await;
             diag.write_count += success_count as u64;
-            if let Some(err) = errors_to_record.last() {
-                diag.error_count += errors_to_record.len() as u64;
-                diag.last_error = Some(err.clone());
+            let error_count = failures.len();
+            if error_count > 0 {
+                diag.error_count += error_count as u64;
+                // Use last failure's error message, avoiding extra clone
+                if let Some((_, err)) = failures.last() {
+                    diag.last_error = Some(err.clone());
+                }
             }
         }
 
@@ -1810,7 +1828,7 @@ impl ProtocolClient for ModbusChannel {
 
         // Log adjustment write
         self.log_context
-            .log_adjustment_write(adjustments_vec, Ok(result.clone()), duration_ms)
+            .log_adjustment_write(adjustments, Ok(result.clone()), duration_ms)
             .await;
 
         Ok(result)

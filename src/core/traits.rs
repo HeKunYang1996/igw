@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -336,15 +337,24 @@ pub struct PointFailure {
     pub point_id: u32,
 
     /// Error message describing the failure.
-    pub error: String,
+    /// Uses `Cow<'static, str>` to avoid allocation for static error messages.
+    pub error: Cow<'static, str>,
 }
 
 impl PointFailure {
-    /// Create a new point failure.
-    pub fn new(point_id: u32, error: impl Into<String>) -> Self {
+    /// Create a new point failure with a static error message (zero allocation).
+    pub fn new(point_id: u32, error: &'static str) -> Self {
         Self {
             point_id,
-            error: error.into(),
+            error: Cow::Borrowed(error),
+        }
+    }
+
+    /// Create a new point failure with a dynamic error message.
+    pub fn with_error(point_id: u32, error: String) -> Self {
+        Self {
+            point_id,
+            error: Cow::Owned(error),
         }
     }
 }

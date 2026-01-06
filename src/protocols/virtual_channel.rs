@@ -202,14 +202,14 @@ impl VirtualChannel {
 
     /// Write a single data point.
     pub async fn write_point(&self, point: DataPoint) -> Result<()> {
-        let mut batch = DataBatch::new();
+        let mut batch = DataBatch::with_capacity(1);
         batch.add(point);
         self.write(&batch).await
     }
 
     /// Get all points currently in the buffer.
     fn get_all_points(&self) -> DataBatch {
-        let mut batch = DataBatch::new();
+        let mut batch = DataBatch::with_capacity(self.data_buffer.len());
         for entry in self.data_buffer.iter() {
             batch.add(entry.value().clone());
         }

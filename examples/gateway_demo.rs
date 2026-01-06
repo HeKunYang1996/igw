@@ -297,16 +297,19 @@ impl Gateway {
                             ch.poll_once().await
                         };
 
+                        // Get count before moving data to avoid clone
+                        let success_count = result.data.len();
+
                         if !result.data.is_empty() {
                             let _ = event_tx.send(GatewayEvent::DataUpdate {
                                 channel_id,
-                                batch: result.data.clone(),
+                                batch: result.data, // move instead of clone
                             });
                         }
 
                         let _ = event_tx.send(GatewayEvent::PollResult {
                             channel_id,
-                            success_count: result.data.len(),
+                            success_count,
                             failures: result.failures,
                         });
                     }

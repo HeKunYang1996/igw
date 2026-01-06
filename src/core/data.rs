@@ -212,6 +212,16 @@ impl DataBatch {
         Self::default()
     }
 
+    /// Create an empty batch with pre-allocated capacity.
+    ///
+    /// Use this when you know the approximate number of points to avoid
+    /// repeated reallocations during `add()` calls.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            points: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Create a batch from a vector of points.
     pub fn from_points(points: Vec<DataPoint>) -> Self {
         Self { points }

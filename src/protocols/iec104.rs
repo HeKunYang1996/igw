@@ -355,8 +355,9 @@ impl Iec104Channel {
             }
             Ok(None) => Ok(()),
             Err(e) => {
-                self.record_error(&e.to_string()).await;
-                Err(GatewayError::Protocol(e.to_string()))
+                let err_msg = e.to_string();
+                self.record_error(err_msg.clone()).await;
+                Err(GatewayError::Protocol(err_msg))
             }
         }
     }
@@ -410,7 +411,7 @@ impl Iec104Channel {
                 // Interrogation finished
             }
             Iec104Event::Error(msg) => {
-                self.record_error(&msg).await;
+                self.record_error(msg.clone()).await;
                 let _ = self.event_tx.send(DataEvent::Error(msg));
             }
         }
@@ -453,10 +454,10 @@ impl Iec104Channel {
     }
 
     /// Record an error.
-    async fn record_error(&self, error: &str) {
+    async fn record_error(&self, error: String) {
         let mut diag = self.diagnostics.write().await;
         diag.error_count += 1;
-        diag.last_error = Some(error.to_string());
+        diag.last_error = Some(error);
     }
 
     /// Find point config by ID (O(1) lookup).
@@ -518,8 +519,9 @@ impl ProtocolClient for Iec104Channel {
             }
             Err(e) => {
                 self.set_state(ConnectionState::Error);
-                self.record_error(&e.to_string()).await;
-                Err(GatewayError::Connection(e.to_string()))
+                let err_msg = e.to_string();
+                self.record_error(err_msg.clone()).await;
+                Err(GatewayError::Connection(err_msg))
             }
         }
     }
@@ -555,13 +557,11 @@ impl ProtocolClient for Iec104Channel {
             }
         };
 
-        let mut batch = DataBatch::new();
-        if let Some(voltage_iec104::Iec104Event::DataUpdate(points)) = event {
-            let converted = self.convert_data_points(points).await;
-            for point in converted.iter() {
-                batch.add(point.clone());
-            }
-        }
+        let batch = if let Some(voltage_iec104::Iec104Event::DataUpdate(points)) = event {
+            self.convert_data_points(points).await
+        } else {
+            DataBatch::new()
+        };
 
         if !batch.is_empty() {
             let mut diag = self.diagnostics.write().await;

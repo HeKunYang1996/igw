@@ -187,11 +187,39 @@ impl CanChannelParamsConfig {
     }
 }
 
+/// CAN frame data - stack-allocated fixed buffer for up to 8 bytes
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CanFrameData {
+    data: [u8; 8],
+    len: u8,
+}
+
+impl CanFrameData {
+    /// Create from a byte slice (copies up to 8 bytes)
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let mut data = [0u8; 8];
+        let len = bytes.len().min(8) as u8;
+        data[..len as usize].copy_from_slice(&bytes[..len as usize]);
+        Self { data, len }
+    }
+
+    /// Get the data as a slice
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+
+    /// Get the length
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
 /// CAN frame cache - stores the latest received frame for each CAN-ID
+/// Uses fixed-size arrays instead of Vec to avoid heap allocation per frame
 #[derive(Debug, Clone, Default)]
 pub struct CanFrameCache {
-    /// Map from CAN-ID to frame data (up to 8 bytes)
-    frames: HashMap<u32, Vec<u8>>,
+    /// Map from CAN-ID to frame data (fixed 8-byte buffer + length)
+    frames: HashMap<u32, CanFrameData>,
 }
 
 impl CanFrameCache {
@@ -202,14 +230,14 @@ impl CanFrameCache {
         }
     }
 
-    /// Update cache with a new frame
-    pub fn update(&mut self, can_id: u32, data: Vec<u8>) {
-        self.frames.insert(can_id, data);
+    /// Update cache with a new frame (no heap allocation for the data)
+    pub fn update(&mut self, can_id: u32, data: &[u8]) {
+        self.frames.insert(can_id, CanFrameData::from_slice(data));
     }
 
     /// Get the latest frame data for a CAN-ID
     pub fn get(&self, can_id: u32) -> Option<&[u8]> {
-        self.frames.get(&can_id).map(|v| v.as_slice())
+        self.frames.get(&can_id).map(|f| f.as_slice())
     }
 
     /// Get number of cached CAN-IDs
@@ -218,7 +246,7 @@ impl CanFrameCache {
     }
 
     /// Get all frames (for debugging)
-    pub fn iter(&self) -> impl Iterator<Item = (&u32, &Vec<u8>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &CanFrameData)> {
         self.frames.iter()
     }
 }

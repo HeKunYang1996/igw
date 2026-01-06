@@ -151,13 +151,14 @@ impl CommandBatcher {
             return false;
         }
 
-        // Sort by register address
-        let mut sorted = commands.to_vec();
-        sorted.sort_by_key(|c| c.register_address);
+        // Sort indices by register address (avoid cloning BatchCommands)
+        let mut indices: Vec<usize> = (0..commands.len()).collect();
+        indices.sort_by_key(|&i| commands[i].register_address);
 
-        let mut expected_addr = sorted[0].register_address;
+        let mut expected_addr = commands[indices[0]].register_address;
 
-        for cmd in &sorted {
+        for &i in &indices {
+            let cmd = &commands[i];
             if cmd.register_address != expected_addr {
                 return false; // Gap detected
             }

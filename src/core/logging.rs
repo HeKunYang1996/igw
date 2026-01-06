@@ -36,8 +36,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::core::{
-    AdjustmentCommand, ConnectionState, ControlCommand, DataBatch, ReadRequest, ReadResponse,
-    WriteResult,
+    AdjustmentCommand, ConnectionState, ControlCommand, ReadRequest, ReadResponse, WriteResult,
 };
 
 // ============================================================================
@@ -270,8 +269,8 @@ pub enum ChannelLogEvent {
     PollCycleCompleted {
         /// Event timestamp.
         timestamp: SystemTime,
-        /// Data batch collected.
-        data: DataBatch,
+        /// Number of points in the batch (avoids cloning entire DataBatch for logging).
+        points_count: usize,
         /// Cycle duration in milliseconds.
         duration_ms: u64,
         /// Number of successfully read points.
@@ -573,7 +572,12 @@ impl ChannelLogConfig {
     pub fn disabled() -> Self {
         Self {
             enabled_events: HashSet::new(),
-            ..Default::default()
+            verbosity: LogVerbosity::Standard,
+            log_successful_reads: false,
+            log_successful_writes: false,
+            poll_cycle_sample_rate: 0,
+            log_raw_packets: false,
+            max_packet_size: 0,
         }
     }
 
@@ -763,24 +767,35 @@ impl PrintLogHandler {
     }
 
     /// Format bytes as hex string.
+    ///
+    /// Optimized to use a single allocation with `String::with_capacity`.
     fn format_hex(data: &[u8], max_len: usize) -> String {
+        use std::fmt::Write;
+
         let truncated = if max_len > 0 && data.len() > max_len {
             &data[..max_len]
         } else {
             data
         };
 
-        let hex = truncated
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Pre-allocate: "XX " per byte (3 chars), plus suffix if truncated
+        let is_truncated = max_len > 0 && data.len() > max_len;
+        let capacity = truncated.len() * 3 + if is_truncated { 30 } else { 0 };
+        let mut hex = String::with_capacity(capacity);
 
-        if max_len > 0 && data.len() > max_len {
-            format!("{} ... ({} bytes total)", hex, data.len())
-        } else {
-            hex
+        for (i, b) in truncated.iter().enumerate() {
+            if i > 0 {
+                hex.push(' ');
+            }
+            // write! to String is infallible
+            let _ = write!(&mut hex, "{:02X}", b);
         }
+
+        if is_truncated {
+            let _ = write!(&mut hex, " ... ({} bytes total)", data.len());
+        }
+
+        hex
     }
 }
 
@@ -847,7 +862,7 @@ impl ChannelLogHandler for PrintLogHandler {
                 );
             }
             ChannelLogEvent::PollCycleCompleted {
-                data,
+                points_count,
                 duration_ms,
                 success_count,
                 failed_count,
@@ -858,7 +873,7 @@ impl ChannelLogHandler for PrintLogHandler {
                     self.prefix,
                     channel_id,
                     event_type,
-                    data.len(),
+                    points_count,
                     success_count,
                     failed_count,
                     duration_ms
@@ -906,8 +921,20 @@ impl Default for CompositeLogHandler {
 #[async_trait]
 impl ChannelLogHandler for CompositeLogHandler {
     async fn on_log(&self, channel_id: u32, event: ChannelLogEvent) {
-        for handler in &self.handlers {
-            handler.on_log(channel_id, event.clone()).await;
+        let len = self.handlers.len();
+        if len == 0 {
+            return;
+        }
+
+        // Optimization: clone for first N-1 handlers, move for the last one
+        for (i, handler) in self.handlers.iter().enumerate() {
+            if i == len - 1 {
+                // Last handler: move the event instead of cloning
+                handler.on_log(channel_id, event).await;
+                return;
+            } else {
+                handler.on_log(channel_id, event.clone()).await;
+            }
         }
     }
 }
@@ -979,7 +1006,7 @@ impl ChannelLogHandler for TracingLogHandler {
                 }
             },
             ChannelLogEvent::PollCycleCompleted {
-                data,
+                points_count,
                 duration_ms,
                 success_count,
                 failed_count,
@@ -987,7 +1014,7 @@ impl ChannelLogHandler for TracingLogHandler {
             } => {
                 trace!(
                     channel_id = channel_id,
-                    points_count = data.len(),
+                    points_count = points_count,
                     success_count = success_count,
                     failed_count = failed_count,
                     duration_ms = duration_ms,
@@ -1180,15 +1207,23 @@ impl LogContext {
     }
 
     /// Log a control write event.
+    ///
+    /// Takes `&[ControlCommand]` to avoid forcing callers to allocate.
+    /// The slice is only cloned if the event will actually be logged.
     pub async fn log_control_write(
         &self,
-        commands: Vec<ControlCommand>,
+        commands: &[ControlCommand],
         result: Result<WriteResult, String>,
         duration_ms: u64,
     ) {
+        // Fast path: skip allocation if logging is disabled
+        if self.handler.is_none() || !self.config.is_enabled(LogEventType::ControlWrite) {
+            return;
+        }
+
         self.log(ChannelLogEvent::ControlWrite {
             timestamp: SystemTime::now(),
-            commands,
+            commands: commands.to_vec(),
             result,
             duration_ms,
         })
@@ -1196,15 +1231,23 @@ impl LogContext {
     }
 
     /// Log an adjustment write event.
+    ///
+    /// Takes `&[AdjustmentCommand]` to avoid forcing callers to allocate.
+    /// The slice is only cloned if the event will actually be logged.
     pub async fn log_adjustment_write(
         &self,
-        commands: Vec<AdjustmentCommand>,
+        commands: &[AdjustmentCommand],
         result: Result<WriteResult, String>,
         duration_ms: u64,
     ) {
+        // Fast path: skip allocation if logging is disabled
+        if self.handler.is_none() || !self.config.is_enabled(LogEventType::AdjustmentWrite) {
+            return;
+        }
+
         self.log(ChannelLogEvent::AdjustmentWrite {
             timestamp: SystemTime::now(),
-            commands,
+            commands: commands.to_vec(),
             result,
             duration_ms,
         })
@@ -1212,9 +1255,11 @@ impl LogContext {
     }
 
     /// Log a poll cycle event.
+    ///
+    /// Takes `points_count` instead of the full `DataBatch` to avoid cloning.
     pub async fn log_poll_cycle(
         &self,
-        data: DataBatch,
+        points_count: usize,
         duration_ms: u64,
         success_count: usize,
         failed_count: usize,
@@ -1222,7 +1267,7 @@ impl LogContext {
         if self.should_log_poll_cycle() {
             self.log(ChannelLogEvent::PollCycleCompleted {
                 timestamp: SystemTime::now(),
-                data,
+                points_count,
                 duration_ms,
                 success_count,
                 failed_count,
@@ -1261,19 +1306,17 @@ impl LogContext {
     pub async fn log_raw_packet(
         &self,
         direction: PacketDirection,
-        data: Vec<u8>,
+        mut data: Vec<u8>,
         metadata: PacketMetadata,
     ) {
         if !self.config.should_log_raw_packets() {
             return;
         }
 
-        // Apply max packet size truncation
-        let data = if self.config.max_packet_size > 0 && data.len() > self.config.max_packet_size {
-            data[..self.config.max_packet_size].to_vec()
-        } else {
-            data
-        };
+        // Apply max packet size truncation (in-place, no reallocation)
+        if self.config.max_packet_size > 0 && data.len() > self.config.max_packet_size {
+            data.truncate(self.config.max_packet_size);
+        }
 
         self.log(ChannelLogEvent::RawPacket {
             timestamp: SystemTime::now(),

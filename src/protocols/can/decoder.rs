@@ -5,7 +5,6 @@
 
 use crate::core::data::Value;
 use crate::core::error::{GatewayError, Result};
-use crate::core::quality::Quality;
 use crate::protocols::can::config::CanPoint;
 
 use std::collections::HashMap;
@@ -14,8 +13,6 @@ use std::collections::HashMap;
 pub struct PointManager {
     /// All points indexed by point_id
     points: HashMap<u32, CanPoint>,
-    /// Points grouped by CAN-ID for efficient lookup
-    points_by_can_id: HashMap<u32, Vec<u32>>,
 }
 
 impl PointManager {
@@ -23,35 +20,29 @@ impl PointManager {
     pub fn new() -> Self {
         Self {
             points: HashMap::new(),
-            points_by_can_id: HashMap::new(),
         }
     }
 
     /// Add a point to the manager
     pub fn add_point(&mut self, point: CanPoint) {
-        let can_id = point.can_id;
-        let point_id = point.point_id;
-
-        self.points.insert(point_id, point);
-
-        self.points_by_can_id
-            .entry(can_id)
-            .or_insert_with(Vec::new)
-            .push(point_id);
+        self.points.insert(point.point_id, point);
     }
 
     /// Apply mappings to decode CAN frames into data points
+    ///
+    /// Returns a HashMap of point_id -> Value for successfully decoded points.
+    /// Quality is always Good for decoded values (no bad quality from CAN decode).
     pub fn apply_mappings(
         &self,
         frame_cache: &super::config::CanFrameCache,
-    ) -> Result<HashMap<u32, (Value, Quality)>> {
-        let mut result = HashMap::new();
+    ) -> Result<HashMap<u32, Value>> {
+        let mut result = HashMap::with_capacity(self.points.len());
 
         for (point_id, point) in &self.points {
             if let Some(frame_data) = frame_cache.get(point.can_id) {
                 match decode_point(point, frame_data) {
                     Ok(value) => {
-                        result.insert(*point_id, (value, Quality::Good));
+                        result.insert(*point_id, value);
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing-support")]
@@ -65,13 +56,40 @@ impl PointManager {
     }
 }
 
-/// Extract a field from CAN data
+/// Extracted field data - stack-allocated buffer with length
+/// CAN frames are max 8 bytes, so [u8; 8] is sufficient
+struct ExtractedField {
+    data: [u8; 8],
+    len: u8,
+}
+
+impl ExtractedField {
+    fn new(bytes: &[u8]) -> Self {
+        let mut data = [0u8; 8];
+        let len = bytes.len().min(8) as u8;
+        data[..len as usize].copy_from_slice(&bytes[..len as usize]);
+        Self { data, len }
+    }
+
+    fn single(byte: u8) -> Self {
+        Self {
+            data: [byte, 0, 0, 0, 0, 0, 0, 0],
+            len: 1,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
+}
+
+/// Extract a field from CAN data (stack-allocated, no heap allocation)
 fn extract_field(
     data: &[u8],
     byte_offset: u8,
     bit_position: u8,
     bit_length: u8,
-) -> Result<Vec<u8>> {
+) -> Result<ExtractedField> {
     let byte_offset = byte_offset as usize;
 
     // Validate parameters
@@ -95,7 +113,7 @@ fn extract_field(
             }
             let byte = data[byte_offset];
             let value = (byte >> bit_position) & 0x03;
-            Ok(vec![value])
+            Ok(ExtractedField::single(value))
         }
         8 => {
             // Single byte
@@ -105,7 +123,7 @@ fn extract_field(
                     bit_position
                 )));
             }
-            Ok(vec![data[byte_offset]])
+            Ok(ExtractedField::single(data[byte_offset]))
         }
         16 => {
             // 2 bytes (Little-Endian)
@@ -121,7 +139,7 @@ fn extract_field(
                     byte_offset
                 )));
             }
-            Ok(vec![data[byte_offset], data[byte_offset + 1]])
+            Ok(ExtractedField::new(&data[byte_offset..byte_offset + 2]))
         }
         32 => {
             // 4 bytes (Little-Endian)
@@ -137,7 +155,7 @@ fn extract_field(
                     byte_offset
                 )));
             }
-            Ok(data[byte_offset..byte_offset + 4].to_vec())
+            Ok(ExtractedField::new(&data[byte_offset..byte_offset + 4]))
         }
         64 => {
             // 8 bytes (for ASCII strings)
@@ -153,7 +171,7 @@ fn extract_field(
                     byte_offset
                 )));
             }
-            Ok(data[byte_offset..byte_offset + 8].to_vec())
+            Ok(ExtractedField::new(&data[byte_offset..byte_offset + 8]))
         }
         _ => Err(GatewayError::Protocol(format!(
             "Unsupported bit length: {}",
@@ -164,13 +182,14 @@ fn extract_field(
 
 /// Decode a CAN point
 fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
-    // Extract raw bytes
-    let raw_bytes = extract_field(
+    // Extract raw bytes (stack-allocated)
+    let field = extract_field(
         frame_data,
         point.byte_offset,
         point.bit_position,
         point.bit_length,
     )?;
+    let raw_bytes = field.as_slice();
 
     // Decode based on data type
     let raw_value = match point.data_type.as_str() {
@@ -230,9 +249,12 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
         }
         "ascii" => {
             // Decode ASCII string, stopping at first null byte
-            let s = String::from_utf8_lossy(&raw_bytes);
-            let trimmed = s.trim_end_matches('\0').to_string();
-            Value::String(trimmed)
+            // Use into_owned() + in-place truncation to avoid double allocation
+            let mut s = String::from_utf8_lossy(raw_bytes).into_owned();
+            while s.ends_with('\0') {
+                s.pop();
+            }
+            Value::String(s)
         }
         _ => {
             return Err(GatewayError::Protocol(format!(

@@ -12,34 +12,48 @@ use super::wrappers::VirtualRuntime;
 
 /// Create a channel from configuration.
 pub fn create_channel(config: &ChannelConfig) -> Result<Box<dyn ChannelRuntime>> {
-    match config.protocol.to_lowercase().as_str() {
-        #[cfg(feature = "modbus")]
-        "modbus" => create_modbus_channel(config),
+    let protocol = &config.protocol;
 
-        #[cfg(feature = "iec104")]
-        "iec104" => create_iec104_channel(config),
-
-        #[cfg(feature = "opcua")]
-        "opcua" => create_opcua_channel(config),
-
-        #[cfg(all(feature = "can", target_os = "linux"))]
-        "can" => create_can_channel(config),
-
-        #[cfg(all(feature = "gpio", target_os = "linux"))]
-        "gpio" => create_gpio_channel(config),
-
-        "virtual" => create_virtual_channel(config),
-
-        protocol => Err(GatewayError::Config(format!(
-            "Unsupported protocol: {}. Check if the required feature is enabled.",
-            protocol
-        ))),
+    // Use eq_ignore_ascii_case to avoid String allocation from to_lowercase()
+    #[cfg(feature = "modbus")]
+    if protocol.eq_ignore_ascii_case("modbus") {
+        return create_modbus_channel(config);
     }
+
+    #[cfg(feature = "iec104")]
+    if protocol.eq_ignore_ascii_case("iec104") {
+        return create_iec104_channel(config);
+    }
+
+    #[cfg(feature = "opcua")]
+    if protocol.eq_ignore_ascii_case("opcua") {
+        return create_opcua_channel(config);
+    }
+
+    #[cfg(all(feature = "can", target_os = "linux"))]
+    if protocol.eq_ignore_ascii_case("can") {
+        return create_can_channel(config);
+    }
+
+    #[cfg(all(feature = "gpio", target_os = "linux"))]
+    if protocol.eq_ignore_ascii_case("gpio") {
+        return create_gpio_channel(config);
+    }
+
+    if protocol.eq_ignore_ascii_case("virtual") {
+        return create_virtual_channel(config);
+    }
+
+    Err(GatewayError::Config(format!(
+        "Unsupported protocol: {}. Check if the required feature is enabled.",
+        protocol
+    )))
 }
 
 /// Convert PointDef list to PointConfig list.
 fn build_point_configs(config: &ChannelConfig) -> Result<Vec<PointConfig>> {
-    let mut points = Vec::new();
+    // Pre-allocate with upper bound (some points may be disabled)
+    let mut points = Vec::with_capacity(config.points.len());
 
     for point_def in &config.points {
         if !point_def.enabled {

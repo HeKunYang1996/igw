@@ -216,7 +216,7 @@ impl CanClient {
 
                         // Check if this is a LYNK protocol frame
                         if LynkCanId::is_lynk_id(can_id) {
-                            let data = frame.data().to_vec();
+                            let data = frame.data();
 
                             #[cfg(feature = "tracing-support")]
                             tracing::info!(
@@ -225,6 +225,7 @@ impl CanClient {
                                 data
                             );
 
+                            // Update cache with slice reference (no heap allocation)
                             frame_cache.write().await.update(can_id, data);
                         } else {
                             #[cfg(feature = "tracing-support")]
@@ -288,8 +289,8 @@ impl CanClient {
                 #[cfg(feature = "tracing-support")]
                 {
                     tracing::info!("Frame cache has {} CAN IDs", cache.len());
-                    for (can_id, data) in cache.iter() {
-                        tracing::debug!("  CAN ID 0x{:03X}: {} bytes", can_id, data.len());
+                    for (can_id, frame_data) in cache.iter() {
+                        tracing::debug!("  CAN ID 0x{:03X}: {} bytes", can_id, frame_data.len());
                     }
                 }
 
@@ -304,23 +305,20 @@ impl CanClient {
                             continue;
                         }
 
-                        let mut batch = DataBatch::new();
+                        // Pre-allocate batch and update cache in single pass
+                        let mut batch = DataBatch::with_capacity(decoded_points.len());
 
-                        for (point_id, (value, quality)) in decoded_points {
-                            #[cfg(feature = "tracing-support")]
-                            tracing::debug!(
-                                "  Point {}: {:?} (quality: {:?})",
-                                point_id,
-                                value,
-                                quality
-                            );
+                        // Single lock acquisition for all operations
+                        {
+                            let mut cache = cached_data.write().await;
+                            for (point_id, value) in decoded_points {
+                                #[cfg(feature = "tracing-support")]
+                                tracing::debug!("  Point {}: {:?}", point_id, value);
 
-                            let data_point = DataPoint::new(point_id, value);
-
-                            batch.add(data_point.clone());
-
-                            // Update cache
-                            cached_data.write().await.insert(point_id, data_point);
+                                let data_point = DataPoint::new(point_id, value);
+                                batch.add(data_point.clone()); // Clone for batch
+                                cache.insert(point_id, data_point); // Move to cache
+                            }
                         }
 
                         if !batch.is_empty() {

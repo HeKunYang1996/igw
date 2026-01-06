@@ -388,6 +388,26 @@ impl OpcUaChannelConfig {
         let key = make_node_id_key(namespace_index, identifier);
         self.node_id_mapping.get(&key).copied()
     }
+
+    /// Find point_id by NodeId directly (optimized: single format! call).
+    ///
+    /// This avoids the double allocation in handle_data_change where we first
+    /// format the identifier, then call find_point_id which formats again.
+    pub fn find_point_id_by_node_id(&self, node_id: &NodeId) -> Option<u32> {
+        let key = match &node_id.identifier {
+            Identifier::Numeric(n) => format!("ns={};i={}", node_id.namespace, n),
+            Identifier::String(s) => format!("ns={};s={}", node_id.namespace, s.as_ref()),
+            Identifier::Guid(g) => format!("ns={};g={}", node_id.namespace, g),
+            Identifier::ByteString(b) => {
+                format!(
+                    "ns={};b={:?}",
+                    node_id.namespace,
+                    b.value.as_deref().unwrap_or(&[])
+                )
+            }
+        };
+        self.node_id_mapping.get(&key).copied()
+    }
 }
 
 /// OPC UA channel parameters for JSON configuration.
@@ -618,7 +638,8 @@ impl OpcUaChannel {
 
                     // Collect the data we need before spawning
                     let node_id = item.item_to_monitor().node_id.clone();
-                    let item_data = vec![(node_id, data_value)];
+                    // Use stack-allocated array instead of Vec (single element)
+                    let item_data = [(node_id, data_value)];
 
                     tokio::spawn(async move {
                         handle_data_change(
@@ -1063,18 +1084,8 @@ async fn handle_data_change(
     let mut batch = DataBatch::new();
 
     for (node_id, data_value) in items {
-        // Find point_id from NodeID
-        let identifier = match &node_id.identifier {
-            Identifier::Numeric(n) => format!("i={}", n),
-            Identifier::String(s) => format!("s={}", s.as_ref()),
-            Identifier::Guid(g) => format!("g={}", g),
-            Identifier::ByteString(b) => {
-                format!("b={:?}", b.value.as_deref().unwrap_or(&[]))
-            }
-        };
-
-        // Find mapped point_id (skip unconfigured nodes)
-        let point_id = match config.find_point_id(node_id.namespace, &identifier) {
+        // Find mapped point_id directly from NodeId (single format! call)
+        let point_id = match config.find_point_id_by_node_id(node_id) {
             Some(id) => id,
             None => continue, // Skip unconfigured nodes
         };

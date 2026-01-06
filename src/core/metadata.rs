@@ -136,8 +136,10 @@ impl ProtocolRegistry {
         self.protocols.iter().find(|p| p.name == name)
     }
 
-    /// Get all example configurations as (name, config) pairs.
-    pub fn get_examples(&self) -> Vec<(&'static str, &'static str, Value)> {
+    /// Get all example configurations as (protocol_type, label, config) tuples.
+    ///
+    /// Returns owned `String` for label to avoid memory leaks from `Box::leak`.
+    pub fn get_examples(&self) -> Vec<(&'static str, String, Value)> {
         let mut examples = Vec::new();
         for protocol in &self.protocols {
             for driver in &protocol.drivers {
@@ -149,9 +151,6 @@ impl ProtocolRegistry {
                 } else {
                     format!("{} - {}", protocol.display_name, driver.display_name)
                 };
-                // We need to leak the string to get 'static lifetime
-                // This is acceptable because the registry is static
-                let label: &'static str = Box::leak(label.into_boxed_str());
                 examples.push((protocol.protocol_type, label, driver.example_config.clone()));
             }
         }
