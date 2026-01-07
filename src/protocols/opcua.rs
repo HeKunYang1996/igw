@@ -966,7 +966,7 @@ impl ProtocolClient for OpcUaChannel {
 
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
         let mut success_count = 0;
-        let mut failures = Vec::new();
+        let mut failures = Vec::with_capacity(adjustments.len());
 
         for adj in adjustments {
             // Find point config

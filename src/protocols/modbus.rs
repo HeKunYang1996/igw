@@ -1215,8 +1215,10 @@ impl ModbusChannel {
             });
         }
 
+        // Pre-calculate total commands for capacity hint
+        let total_commands: usize = batches.values().map(|v| v.len()).sum();
         let mut success_count = 0;
-        let mut failures = Vec::new();
+        let mut failures = Vec::with_capacity(total_commands);
 
         // Lock client for execution
         let mut client_guard = self.client.lock().await;
@@ -1565,9 +1567,12 @@ impl ProtocolClient for ModbusChannel {
         }; // Lock released here
 
         let mut batch = DataBatch::default();
-        let mut failures = Vec::new();
         let mut read_count = 0u64;
         let mut error_count = 0u64;
+
+        // Pre-calculate total points for capacity hint
+        let total_points: usize = groups.iter().map(|(_, pts)| pts.len()).sum();
+        let mut failures = Vec::with_capacity(total_points);
 
         for ((_slave_id, _fc), points) in groups.iter() {
             let results = Self::read_point_group(
