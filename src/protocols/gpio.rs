@@ -54,6 +54,7 @@
 //! gpio.write_control(&[ControlCommand::latching(101, true)]).await?;
 //! ```
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -398,22 +399,25 @@ impl GpiodDriver {
     }
 
     /// Resolve chip and line for a pin, handling global GPIO number auto-conversion.
-    fn resolve_chip_line(pin: &GpioPinConfig) -> Result<(String, u32)> {
+    ///
+    /// Returns `Cow<'_, str>` to avoid cloning when the chip name is already in the config.
+    fn resolve_chip_line(pin: &GpioPinConfig) -> Result<(Cow<'_, str>, u32)> {
         // If gpio_number is provided and chip is default/empty, auto-resolve
         if let Some(gpio_num) = pin.gpio_number {
             if pin.chip.is_empty() || pin.chip == "gpiochip0" {
                 // Check if it's actually on gpiochip0
                 if gpio_num < 32 {
-                    // Likely actually on gpiochip0
-                    return Ok((pin.chip.clone(), pin.pin));
+                    // Likely actually on gpiochip0 - borrow from config
+                    return Ok((Cow::Borrowed(&pin.chip), pin.pin));
                 }
-                // Auto-resolve global GPIO number to chip + line
-                return resolve_gpio_to_chip_line(gpio_num);
+                // Auto-resolve global GPIO number to chip + line (requires allocation)
+                let (chip, line) = resolve_gpio_to_chip_line(gpio_num)?;
+                return Ok((Cow::Owned(chip), line));
             }
         }
 
-        // Use the configured chip and pin directly
-        Ok((pin.chip.clone(), pin.pin))
+        // Use the configured chip directly - no allocation!
+        Ok((Cow::Borrowed(&pin.chip), pin.pin))
     }
 }
 
@@ -482,7 +486,7 @@ impl GpioDriver for GpiodDriver {
         // Auto-resolve global GPIO number to chip + line
         let (chip_name, line) = Self::resolve_chip_line(pin)?;
 
-        let chip = Chip::new(&chip_name).await.map_err(|e| {
+        let chip = Chip::new(&*chip_name).await.map_err(|e| {
             GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", chip_name, e))
         })?;
 
@@ -505,7 +509,7 @@ impl GpioDriver for GpiodDriver {
         // Auto-resolve global GPIO number to chip + line
         let (chip_name, line) = Self::resolve_chip_line(pin)?;
 
-        let chip = Chip::new(&chip_name).await.map_err(|e| {
+        let chip = Chip::new(&*chip_name).await.map_err(|e| {
             GatewayError::Protocol(format!("Failed to open GPIO chip '{}': {}", chip_name, e))
         })?;
 
